@@ -70,50 +70,37 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 		return nil, fmt.Errorf("get machineconfig from %s: %w", nodeIP, err)
 	}
 
-	// MarshalYAML returns COSI envelope: {node, metadata, spec: |<raw config>}
-	// The spec is a YAML literal block string containing the raw machine config.
-	// We must extract it as a raw string — NOT parse it as a Go map (which
-	// would lose multi-document structure and corrupt the config).
-	raw, err := resource.MarshalYAML(r)
-	if err != nil {
-		return nil, fmt.Errorf("marshal machineconfig from %s: %w", nodeIP, err)
+	// resource.MarshalYAML + yaml.Marshal double-encodes the spec field,
+	// corrupting multi-document YAML. Instead, use the Spec() interface
+	// to access the raw config bytes directly.
+	//
+	// The COSI resource wraps the config; we need the unwrapped content.
+	// Access the Spec field via type assertion on the resource interface.
+	type specProvider interface {
+		Spec() any
 	}
 
-	fullBytes, err := yaml.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("yaml encode machineconfig from %s: %w", nodeIP, err)
+	sp, ok := r.(specProvider)
+	if !ok {
+		return nil, fmt.Errorf("machineconfig resource from %s does not implement Spec()", nodeIP)
 	}
 
-	// Use yaml.Node to extract "spec" as a raw string (preserving original format).
-	var doc yaml.Node
-	if err := yaml.Unmarshal(fullBytes, &doc); err != nil {
-		return nil, fmt.Errorf("parse config node from %s: %w", nodeIP, err)
-	}
+	specVal := sp.Spec()
 
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		mapping := doc.Content[0]
-		if mapping.Kind == yaml.MappingNode {
-			for i := 0; i < len(mapping.Content)-1; i += 2 {
-				key := mapping.Content[i]
-				val := mapping.Content[i+1]
-				if key.Value == "spec" {
-					// ScalarNode with Style=LiteralScalar → raw string value
-					if val.Kind == yaml.ScalarNode && val.Value != "" {
-						return []byte(val.Value), nil
-					}
-					// Fallback: if spec is a mapping node (not a literal string),
-					// re-marshal it (this loses multi-doc structure but is better than nothing).
-					specBytes, mErr := yaml.Marshal(val)
-					if mErr != nil {
-						return nil, fmt.Errorf("marshal spec node from %s: %w", nodeIP, mErr)
-					}
-					return specBytes, nil
-				}
-			}
+	// The spec may be a string (raw YAML) or a typed config object.
+	switch v := specVal.(type) {
+	case string:
+		return []byte(v), nil
+	case []byte:
+		return v, nil
+	default:
+		// Fallback: marshal whatever the spec is to YAML.
+		specBytes, err := yaml.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal config spec from %s: %w", nodeIP, err)
 		}
+		return specBytes, nil
 	}
-
-	return nil, fmt.Errorf("spec field not found in config envelope from %s", nodeIP)
 }
 
 // NodeConfigHash returns a SHA-256 hash of the node's current machine config.
