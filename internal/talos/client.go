@@ -85,18 +85,25 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 	}
 
 	// Parse envelope and extract spec (the actual machine config).
-	var envelope struct {
-		Spec string `yaml:"spec"`
-	}
+	// The COSI MarshalYAML produces {metadata: ..., spec: <map>} where spec
+	// is the machine config as a YAML map (not a string).
+	var envelope map[string]any
 	if err := yaml.Unmarshal(fullBytes, &envelope); err != nil {
 		return nil, fmt.Errorf("parse config envelope from %s: %w", nodeIP, err)
 	}
 
-	if envelope.Spec == "" {
+	spec, ok := envelope["spec"]
+	if !ok || spec == nil {
 		return nil, fmt.Errorf("empty config spec from %s", nodeIP)
 	}
 
-	return []byte(envelope.Spec), nil
+	// Re-marshal just the spec portion to YAML bytes.
+	specBytes, err := yaml.Marshal(spec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config spec from %s: %w", nodeIP, err)
+	}
+
+	return specBytes, nil
 }
 
 // NodeConfigHash returns a SHA-256 hash of the node's current machine config.
