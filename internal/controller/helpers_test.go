@@ -24,13 +24,15 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
+const workerName = "worker-1"
+
 // --- nodeInternalIP ---
 
 func TestNodeInternalIP_Found(t *testing.T) {
 	node := &corev1.Node{
 		Status: corev1.NodeStatus{
 			Addresses: []corev1.NodeAddress{
-				{Type: corev1.NodeHostName, Address: "worker-1"},
+				{Type: corev1.NodeHostName, Address: workerName},
 				{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
 				{Type: corev1.NodeExternalIP, Address: "203.0.113.5"},
 			},
@@ -46,7 +48,7 @@ func TestNodeInternalIP_NotFound(t *testing.T) {
 	node := &corev1.Node{
 		Status: corev1.NodeStatus{
 			Addresses: []corev1.NodeAddress{
-				{Type: corev1.NodeHostName, Address: "worker-1"},
+				{Type: corev1.NodeHostName, Address: workerName},
 				{Type: corev1.NodeExternalIP, Address: "203.0.113.5"},
 			},
 		},
@@ -101,7 +103,7 @@ func TestIsControlPlane_WithoutLabel(t *testing.T) {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				"kubernetes.io/hostname": "worker-1",
+				"kubernetes.io/hostname": workerName,
 			},
 		},
 	}
@@ -181,7 +183,7 @@ func TestCountUpdating_Mixed(t *testing.T) {
 
 func TestPickNextNode_PrefersWorkersOverCPs(t *testing.T) {
 	cpNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "cp-1"}}
-	workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-1"}}
+	workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: workerName}}
 
 	assessments := []nodeAssessment{
 		{node: cpNode, isCP: true, versionDrift: true, isUpdating: false},
@@ -192,14 +194,14 @@ func TestPickNextNode_PrefersWorkersOverCPs(t *testing.T) {
 	if picked == nil {
 		t.Fatal("expected a node to be picked")
 	}
-	if picked.node.Name != "worker-1" {
+	if picked.node.Name != workerName {
 		t.Fatalf("expected worker-1 to be preferred over cp-1, got %s", picked.node.Name)
 	}
 }
 
 func TestPickNextNode_PicksCPWhenNoWorkersNeedUpdate(t *testing.T) {
 	cpNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "cp-1"}}
-	workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-1"}}
+	workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: workerName}}
 
 	assessments := []nodeAssessment{
 		{node: cpNode, isCP: true, configDrift: true, isUpdating: false},
@@ -229,7 +231,7 @@ func TestPickNextNode_NilWhenAllSynced(t *testing.T) {
 }
 
 func TestPickNextNode_SkipsAlreadyUpdating(t *testing.T) {
-	worker1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-1"}}
+	worker1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: workerName}}
 	worker2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-2"}}
 
 	assessments := []nodeAssessment{
@@ -286,7 +288,7 @@ func TestPickNextNode_EmptyAssessments(t *testing.T) {
 }
 
 func TestPickNextNode_ConfigDriftAlsoCounts(t *testing.T) {
-	worker := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-1"}}
+	worker := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: workerName}}
 
 	assessments := []nodeAssessment{
 		// Config drift but no version drift — should still be picked.
@@ -297,7 +299,7 @@ func TestPickNextNode_ConfigDriftAlsoCounts(t *testing.T) {
 	if picked == nil {
 		t.Fatal("expected node with config drift to be picked")
 	}
-	if picked.node.Name != "worker-1" {
+	if picked.node.Name != workerName {
 		t.Fatalf("expected worker-1, got %s", picked.node.Name)
 	}
 }
@@ -374,13 +376,13 @@ func TestMatchesNode_NilSelector(t *testing.T) {
 func TestMatchesNode_MatchLabels_Match(t *testing.T) {
 	sel := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
-			"kubernetes.io/hostname": "worker-1",
+			"kubernetes.io/hostname": workerName,
 		},
 	}
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				"kubernetes.io/hostname":                "worker-1",
+				"kubernetes.io/hostname":                workerName,
 				"node-role.kubernetes.io/control-plane": "",
 			},
 		},
@@ -393,7 +395,7 @@ func TestMatchesNode_MatchLabels_Match(t *testing.T) {
 func TestMatchesNode_MatchLabels_NoMatch(t *testing.T) {
 	sel := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
-			"kubernetes.io/hostname": "worker-1",
+			"kubernetes.io/hostname": workerName,
 		},
 	}
 	node := &corev1.Node{
@@ -539,7 +541,7 @@ func TestMatchesNode_MatchExpressions_Exists(t *testing.T) {
 	workerNode := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				"kubernetes.io/hostname": "worker-1",
+				"kubernetes.io/hostname": workerName,
 			},
 		},
 	}
@@ -561,7 +563,7 @@ func TestMatchesNode_MatchExpressions_DoesNotExist(t *testing.T) {
 	workerNode := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				"kubernetes.io/hostname": "worker-1",
+				"kubernetes.io/hostname": workerName,
 			},
 		},
 	}
@@ -599,7 +601,7 @@ func TestMatchesNode_CombinedMatchLabelsAndExpressions(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				"zone":                   "us-east-1a",
-				"kubernetes.io/hostname": "worker-1",
+				"kubernetes.io/hostname": workerName,
 			},
 		},
 	}

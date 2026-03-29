@@ -501,10 +501,9 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 		err := r.SubResource("eviction").Create(ctx, pod, eviction)
 		if err != nil {
 			if apierrors.IsTooManyRequests(err) {
-				// PDB blocking — wait and retry.
-				log.Info("PDB blocking eviction, waiting", "pod", pod.Name)
+				// PDB blocking — wait and retry on next drain cycle.
+				log.Info("PDB blocking eviction, will retry", "pod", pod.Name)
 				time.Sleep(5 * time.Second)
-				i-- // retry this pod
 				continue
 			}
 			if apierrors.IsNotFound(err) {
@@ -722,7 +721,7 @@ func hashConfig(data []byte) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *FleetNodeSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.Recorder = mgr.GetEventRecorderFor("talos-fleet-controller")
+	r.Recorder = mgr.GetEventRecorderFor("talos-fleet-controller") //nolint:staticcheck // GetEventRecorder not yet available in v0.23
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1alpha1.FleetNodeSet{}).
