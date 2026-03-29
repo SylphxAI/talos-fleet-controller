@@ -38,12 +38,12 @@ func mergeYAML(base, overlay string) ([]byte, error) {
 		return []byte(base), nil
 	}
 
-	var baseMap map[string]interface{}
+	var baseMap map[string]any
 	if err := yaml.Unmarshal([]byte(base), &baseMap); err != nil {
 		return nil, fmt.Errorf("parse base YAML: %w", err)
 	}
 
-	var overlayMap map[string]interface{}
+	var overlayMap map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &overlayMap); err != nil {
 		return nil, fmt.Errorf("parse overlay YAML: %w", err)
 	}
@@ -70,12 +70,12 @@ func (r *FleetNodeSetReconciler) mergeConfigWithCurrent(
 	currentConfigYAML []byte,
 	desiredPatch []byte,
 ) ([]byte, error) {
-	var currentMap map[string]interface{}
+	var currentMap map[string]any
 	if err := yaml.Unmarshal(currentConfigYAML, &currentMap); err != nil {
 		return nil, fmt.Errorf("parse current config: %w", err)
 	}
 
-	var patchMap map[string]interface{}
+	var patchMap map[string]any
 	if err := yaml.Unmarshal(desiredPatch, &patchMap); err != nil {
 		return nil, fmt.Errorf("parse desired patch: %w", err)
 	}
