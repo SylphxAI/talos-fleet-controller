@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/siderolabs/talos/pkg/machinery/config"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	configres "github.com/siderolabs/talos/pkg/machinery/resources/config"
 
@@ -85,6 +86,31 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 	}
 
 	return configBytes, nil
+}
+
+// NodeConfigProvider returns the current machine config as a typed config.Provider.
+// Used by configpatcher for proper semantic merge and deterministic comparison.
+func (c *Client) NodeConfigProvider(ctx context.Context, nodeIP string) (config.Provider, error) {
+	nodeCtx := talosclient.WithNode(ctx, nodeIP)
+
+	md := resource.NewMetadata(
+		"config",
+		"MachineConfigs.config.talos.dev",
+		"v1alpha1",
+		resource.VersionUndefined,
+	)
+
+	r, err := c.inner.COSI.Get(nodeCtx, md)
+	if err != nil {
+		return nil, fmt.Errorf("get machineconfig from %s: %w", nodeIP, err)
+	}
+
+	mc, ok := r.(*configres.MachineConfig)
+	if !ok {
+		return nil, fmt.Errorf("unexpected resource type from %s: %T", nodeIP, r)
+	}
+
+	return mc.Provider(), nil
 }
 
 // NodeConfigHash returns a SHA-256 hash of the node's current machine config.

@@ -264,16 +264,24 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Drift detection: merge desired patch onto current config,
-	// then compare the merged result against current. If same → no drift.
-	// This avoids false positives from comparing a patch hash vs full config hash.
-	currentRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
+	// Drift detection using Talos configpatcher for deterministic comparison.
+	// 1. Read current config as config.Provider (typed, not raw bytes)
+	// 2. Build desired patch YAML
+	// 3. Apply patch to current → get "would-be" config
+	// 4. Serialize both to deterministic YAML (Talos encoder) → compare hashes
+	currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
 	if err != nil {
 		log.Error(err, "failed to get config", "node", node.Name)
 		a.err = err
 		return a
 	}
-	a.currentHash = hashConfig(currentRaw)
+
+	currentBytes, err := configToBytes(currentProvider)
+	if err != nil {
+		a.err = fmt.Errorf("encode current config for %s: %w", node.Name, err)
+		return a
+	}
+	a.currentHash = hashConfig(currentBytes)
 
 	desiredPatch, err := r.buildDesiredPatch(fns, node)
 	if err != nil {
@@ -281,32 +289,37 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 		return a
 	}
 
-	// Merge patch on top of current → what the config WOULD be after apply.
-	wouldBe, err := r.mergeConfigWithCurrent(currentRaw, desiredPatch)
+	// Apply patch using Talos configpatcher (multi-doc aware, deterministic).
+	wouldBeProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
 	if err != nil {
 		a.err = fmt.Errorf("compute drift for %s: %w", node.Name, err)
 		return a
 	}
-	a.desiredHash = hashConfig(wouldBe)
+
+	wouldBeBytes, err := configToBytes(wouldBeProvider)
+	if err != nil {
+		a.err = fmt.Errorf("encode would-be config for %s: %w", node.Name, err)
+		return a
+	}
+	a.desiredHash = hashConfig(wouldBeBytes)
 	a.configDrift = (a.currentHash != a.desiredHash)
 
 	return a
 }
 
 // buildDesiredPatch merges base machineConfig + applicable nodeOverride for a node.
-// Returns a YAML patch (not a full config) — must be merged with current config before applying.
+// Returns a YAML strategic merge patch — applied to current config via configpatcher.
 func (r *FleetNodeSetReconciler) buildDesiredPatch(fns *fleetv1alpha1.FleetNodeSet, node *corev1.Node) ([]byte, error) {
-	// Start with base config.
 	var base string
 	if fns.Spec.MachineConfig != nil {
 		base = fns.Spec.MachineConfig.Inline
 		// TODO: support secretRef
 	}
 
-	// Find matching nodeOverride and deep merge on top of base.
+	// Find matching nodeOverride and merge on top of base via configpatcher.
 	for _, override := range fns.Spec.NodeOverrides {
 		if matchesNode(override.NodeSelector, node) {
-			merged, err := mergeYAML(base, override.MachineConfig.Inline)
+			merged, err := mergePatches(base, override.MachineConfig.Inline)
 			if err != nil {
 				return nil, fmt.Errorf("merge nodeOverride for %s: %w", node.Name, err)
 			}
@@ -359,18 +372,25 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 			return fmt.Errorf("build config patch for %s: %w", nodeName, err)
 		}
 
-		// Read current FULL config from node (includes cluster secrets).
-		currentConfig, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
+		// Read current config as typed provider, apply patch via configpatcher.
+		currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
 			return fmt.Errorf("read current config from %s: %w", nodeName, err)
 		}
 
-		// Deep merge patch on top of current config — secrets preserved.
-		mergedConfig, err := r.mergeConfigWithCurrent(currentConfig, desiredPatch)
+		// Apply patch using Talos's own configpatcher (multi-doc, strategic merge).
+		patchedProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
-			return fmt.Errorf("merge config for %s: %w", nodeName, err)
+			return fmt.Errorf("apply config patch for %s: %w", nodeName, err)
+		}
+
+		// Serialize patched config to YAML for ApplyConfiguration API.
+		mergedConfig, err := configToBytes(patchedProvider)
+		if err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			return fmt.Errorf("encode patched config for %s: %w", nodeName, err)
 		}
 
 		mode := talos.ApplyMode(fns.Spec.UpdateStrategy.ConfigApplyMode)
