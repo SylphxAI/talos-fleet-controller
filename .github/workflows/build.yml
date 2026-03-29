@@ -39,22 +39,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Push to our private registry (for cluster deployment)
-      - name: Log in to Sylphx Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: registry.sylphx.com
-          username: robot$ci-push
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ghcr.io/${{ github.repository }}
-            registry.sylphx.com/library/talos-fleet-controller
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
