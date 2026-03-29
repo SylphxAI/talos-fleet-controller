@@ -10,6 +10,7 @@ import (
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	"gopkg.in/yaml.v3"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 )
@@ -66,16 +67,15 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 		return nil, fmt.Errorf("get machineconfig from %s: %w", nodeIP, err)
 	}
 
-	// Marshal the resource spec to YAML bytes for hashing/diffing.
+	// MarshalYAML returns a struct (not bytes) — serialize to YAML bytes for hashing.
 	raw, err := resource.MarshalYAML(r)
 	if err != nil {
 		return nil, fmt.Errorf("marshal machineconfig from %s: %w", nodeIP, err)
 	}
 
-	// MarshalYAML returns interface{}, convert to bytes.
-	rawBytes, ok := raw.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("unexpected marshal type from %s: %T", nodeIP, raw)
+	rawBytes, err := yaml.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("yaml encode machineconfig from %s: %w", nodeIP, err)
 	}
 
 	return rawBytes, nil

@@ -18,7 +18,7 @@ spec:
       serviceAccountName: tfc-controller
       containers:
         - name: manager
-          image: registry.sylphx.com/library/talos-fleet-controller:latest
+          image: registry.sylphx.com/library/talos-fleet-controller:main
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
