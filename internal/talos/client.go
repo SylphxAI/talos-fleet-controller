@@ -9,8 +9,8 @@ import (
 	"fmt"
 
 	"github.com/cosi-project/runtime/pkg/resource"
-	"github.com/siderolabs/talos/pkg/machinery/config"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/config"
 	configres "github.com/siderolabs/talos/pkg/machinery/resources/config"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
