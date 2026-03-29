@@ -408,6 +408,21 @@ spec:
                         config apply or upgrade.
                       format: date-time
                       type: string
+                    lastAppliedConfigHash:
+                      description: |-
+                        lastAppliedConfigHash is the hash of the node's config AFTER our last
+                        successful apply. Used for drift detection: if currentHash matches this,
+                        the config hasn't changed since we last applied → synced.
+                        This avoids false drift from serialization differences between
+                        configpatcher output and Talos internal normalization.
+                      type: string
+                    lastAppliedGeneration:
+                      description: |-
+                        lastAppliedGeneration is the FleetNodeSet generation that was last
+                        successfully applied to this node. If the generation advances,
+                        we re-apply regardless of hash match.
+                      format: int64
+                      type: integer
                     message:
                       description: message provides human-readable detail about the
                         current phase.

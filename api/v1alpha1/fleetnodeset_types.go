@@ -201,6 +201,20 @@ type FleetNodeStatus struct {
 	// +optional
 	DesiredConfigHash string `json:"desiredConfigHash,omitempty"`
 
+	// lastAppliedConfigHash is the hash of the node's config AFTER our last
+	// successful apply. Used for drift detection: if currentHash matches this,
+	// the config hasn't changed since we last applied → synced.
+	// This avoids false drift from serialization differences between
+	// configpatcher output and Talos internal normalization.
+	// +optional
+	LastAppliedConfigHash string `json:"lastAppliedConfigHash,omitempty"`
+
+	// lastAppliedGeneration is the FleetNodeSet generation that was last
+	// successfully applied to this node. If the generation advances,
+	// we re-apply regardless of hash match.
+	// +optional
+	LastAppliedGeneration int64 `json:"lastAppliedGeneration,omitempty"`
+
 	// message provides human-readable detail about the current phase.
 	// +optional
 	Message string `json:"message,omitempty"`

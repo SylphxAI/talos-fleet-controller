@@ -264,45 +264,48 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Drift detection using Talos configpatcher for deterministic comparison.
-	// 1. Read current config as config.Provider (typed, not raw bytes)
-	// 2. Build desired patch YAML
-	// 3. Apply patch to current → get "would-be" config
-	// 4. Serialize both to deterministic YAML (Talos encoder) → compare hashes
-	currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
+	// Drift detection using last-applied hash pattern.
+	//
+	// The "would-be" comparison (hash(current) vs hash(patched)) doesn't work
+	// because Talos normalizes config internally after apply — the stored config
+	// will never byte-match our configpatcher output, causing infinite re-apply.
+	//
+	// Instead, we use the kubectl last-applied-configuration pattern:
+	// - After successful apply: re-read config hash → store as lastAppliedConfigHash
+	// - On each cycle: if currentHash == lastAppliedHash AND generation unchanged → synced
+	// - If generation advanced → re-apply (desired config changed in CRD)
+	// - If currentHash != lastAppliedHash → external drift (someone changed config outside TFC)
+
+	currentRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
 	if err != nil {
 		log.Error(err, "failed to get config", "node", node.Name)
 		a.err = err
 		return a
 	}
+	a.currentHash = hashConfig(currentRaw)
 
-	currentBytes, err := configToBytes(currentProvider)
-	if err != nil {
-		a.err = fmt.Errorf("encode current config for %s: %w", node.Name, err)
-		return a
-	}
-	a.currentHash = hashConfig(currentBytes)
+	// Look up this node's last-applied status.
+	lastApplied := r.getNodeLastApplied(fns, node.Name)
 
-	desiredPatch, err := r.buildDesiredPatch(fns, node)
-	if err != nil {
-		a.err = err
-		return a
+	if lastApplied != nil && lastApplied.LastAppliedConfigHash != "" {
+		// We have a record of a previous apply.
+		if lastApplied.LastAppliedGeneration == fns.Generation {
+			// Same generation — check if config drifted externally.
+			a.configDrift = (a.currentHash != lastApplied.LastAppliedConfigHash)
+			a.desiredHash = lastApplied.LastAppliedConfigHash
+			if a.configDrift {
+				log.Info("external config drift detected", "node", node.Name)
+			}
+		} else {
+			// Generation advanced — CRD spec changed, must re-apply.
+			a.configDrift = true
+			a.desiredHash = "generation-advanced"
+		}
+	} else {
+		// Never applied — always drift.
+		a.configDrift = true
+		a.desiredHash = "never-applied"
 	}
-
-	// Apply patch using Talos configpatcher (multi-doc aware, deterministic).
-	wouldBeProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
-	if err != nil {
-		a.err = fmt.Errorf("compute drift for %s: %w", node.Name, err)
-		return a
-	}
-
-	wouldBeBytes, err := configToBytes(wouldBeProvider)
-	if err != nil {
-		a.err = fmt.Errorf("encode would-be config for %s: %w", node.Name, err)
-		return a
-	}
-	a.desiredHash = hashConfig(wouldBeBytes)
-	a.configDrift = (a.currentHash != a.desiredHash)
 
 	return a
 }
@@ -431,10 +434,20 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		return fmt.Errorf("uncordon %s: %w", nodeName, err)
 	}
 
-	// Done.
+	// Done — re-read config hash from the node POST-APPLY to store as lastApplied.
+	// This is the hash that Talos stores internally after normalization.
+	// Future drift checks compare against this, not against our "would-be" output.
+	postApplyRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
+	postApplyHash := ""
+	if err == nil {
+		postApplyHash = hashConfig(postApplyRaw)
+	} else {
+		log.Error(err, "failed to read post-apply config hash (non-fatal)", "node", nodeName)
+	}
+
 	now := time.Now()
-	r.setNodeStatusSynced(fns, nodeName, fns.Spec.Talos.Version, &now)
-	log.Info("node updated successfully", "node", nodeName)
+	r.setNodeStatusSynced(fns, nodeName, fns.Spec.Talos.Version, postApplyHash, fns.Generation, &now)
+	log.Info("node updated successfully", "node", nodeName, "postApplyHash", postApplyHash)
 
 	return nil
 }
@@ -613,6 +626,12 @@ func (r *FleetNodeSetReconciler) updateStatus(fns *fleetv1alpha1.FleetNodeSet, a
 	fns.Status.Failed = 0
 	fns.Status.Nodes = make([]fleetv1alpha1.FleetNodeStatus, 0, len(assessments))
 
+	// Build a map of existing node statuses to preserve lastApplied fields.
+	existingStatus := make(map[string]*fleetv1alpha1.FleetNodeStatus)
+	for i := range fns.Status.Nodes {
+		existingStatus[fns.Status.Nodes[i].Name] = &fns.Status.Nodes[i]
+	}
+
 	for _, a := range assessments {
 		ns := fleetv1alpha1.FleetNodeStatus{
 			Name:              a.node.Name,
@@ -620,6 +639,13 @@ func (r *FleetNodeSetReconciler) updateStatus(fns *fleetv1alpha1.FleetNodeSet, a
 			DesiredVersion:    a.desiredVer,
 			CurrentConfigHash: a.currentHash,
 			DesiredConfigHash: a.desiredHash,
+		}
+
+		// Preserve lastApplied fields from previous status.
+		if existing, ok := existingStatus[a.node.Name]; ok {
+			ns.LastAppliedConfigHash = existing.LastAppliedConfigHash
+			ns.LastAppliedGeneration = existing.LastAppliedGeneration
+			ns.LastApplied = existing.LastApplied
 		}
 
 		switch {
@@ -658,7 +684,7 @@ func (r *FleetNodeSetReconciler) setNodeStatus(fns *fleetv1alpha1.FleetNodeSet, 
 	}
 }
 
-func (r *FleetNodeSetReconciler) setNodeStatusSynced(fns *fleetv1alpha1.FleetNodeSet, nodeName, version string, t *time.Time) {
+func (r *FleetNodeSetReconciler) setNodeStatusSynced(fns *fleetv1alpha1.FleetNodeSet, nodeName, version, configHash string, generation int64, t *time.Time) {
 	ts := fleetv1alpha1.NewTime(*t)
 	for i := range fns.Status.Nodes {
 		if fns.Status.Nodes[i].Name == nodeName {
@@ -666,9 +692,21 @@ func (r *FleetNodeSetReconciler) setNodeStatusSynced(fns *fleetv1alpha1.FleetNod
 			fns.Status.Nodes[i].CurrentVersion = version
 			fns.Status.Nodes[i].Message = ""
 			fns.Status.Nodes[i].LastApplied = &ts
+			fns.Status.Nodes[i].LastAppliedConfigHash = configHash
+			fns.Status.Nodes[i].LastAppliedGeneration = generation
 			return
 		}
 	}
+}
+
+// getNodeLastApplied returns the stored status for a node, or nil if not found.
+func (r *FleetNodeSetReconciler) getNodeLastApplied(fns *fleetv1alpha1.FleetNodeSet, nodeName string) *fleetv1alpha1.FleetNodeStatus {
+	for i := range fns.Status.Nodes {
+		if fns.Status.Nodes[i].Name == nodeName {
+			return &fns.Status.Nodes[i]
+		}
+	}
+	return nil
 }
 
 // --- Node helpers ---
