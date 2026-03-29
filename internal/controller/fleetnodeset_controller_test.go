@@ -38,7 +38,7 @@ var _ = Describe("FleetNodeSet Controller", func() {
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		fleetnodeset := &fleetv1alpha1.FleetNodeSet{}
 
@@ -51,14 +51,23 @@ var _ = Describe("FleetNodeSet Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: fleetv1alpha1.FleetNodeSetSpec{
+						NodeSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"test-label": "true",
+							},
+						},
+						Talos: fleetv1alpha1.TalosSpec{
+							Version:   "v1.12.4",
+							Schematic: "test-schematic",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &fleetv1alpha1.FleetNodeSet{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
@@ -66,19 +75,22 @@ var _ = Describe("FleetNodeSet Controller", func() {
 			By("Cleanup the specific resource instance FleetNodeSet")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &FleetNodeSetReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+				// TalosClient is nil — reconciler handles this gracefully
+				// (no nodes match the test selector, so Talos API is never called)
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			// No matching nodes → should requeue after standard interval.
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		})
 	})
 })
