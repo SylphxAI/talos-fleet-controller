@@ -1,0 +1,43 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-fleet-controller.fullname" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+rules:
+  # FleetNodeSet CRD — full lifecycle management
+  - apiGroups: ["fleet.talos.dev"]
+    resources: ["fleetnodesets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fleet.talos.dev"]
+    resources: ["fleetnodesets/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fleet.talos.dev"]
+    resources: ["fleetnodesets/finalizers"]
+    verbs: ["update"]
+  # Nodes — read, cordon, uncordon
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Pods — list for drain operations
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Pod eviction — drain before upgrade
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  # Secrets — read Talos ServiceAccount credentials and machineConfig secretRefs
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Events — record reconcile events on FleetNodeSet resources
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Leases — leader election coordination
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{- end }}

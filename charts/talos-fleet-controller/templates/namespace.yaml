@@ -1,0 +1,9 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "talos-fleet-controller.namespace" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurityEnforce }}
+{{- end }}

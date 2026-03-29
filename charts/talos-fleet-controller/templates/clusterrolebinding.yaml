@@ -1,0 +1,16 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-fleet-controller.fullname" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-fleet-controller.serviceAccountName" . }}
+    namespace: {{ include "talos-fleet-controller.namespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-fleet-controller.fullname" . }}
+{{- end }}

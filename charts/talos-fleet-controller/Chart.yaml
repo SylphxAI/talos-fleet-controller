@@ -1,0 +1,20 @@
+apiVersion: v2
+name: talos-fleet-controller
+description: Kubernetes operator that manages Talos Linux node upgrades and machine configuration across fleets of nodes with safety guarantees.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">= 1.28.0"
+home: https://github.com/SylphxAI/talos-fleet-controller
+sources:
+  - https://github.com/SylphxAI/talos-fleet-controller
+keywords:
+  - talos
+  - fleet
+  - operator
+  - kubernetes
+  - node-management
+  - upgrades
+maintainers:
+  - name: SylphxAI
+    url: https://github.com/SylphxAI

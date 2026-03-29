@@ -18,7 +18,7 @@ spec:
       serviceAccountName: tfc-controller
       containers:
         - name: manager
-          image: registry.sylphx.com/library/talos-fleet-controller:main
+          image: ghcr.io/sylphxai/talos-fleet-controller:main
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
@@ -51,6 +51,15 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: talos-secrets
               mountPath: /var/run/secrets/talos.dev

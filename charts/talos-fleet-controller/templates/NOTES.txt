@@ -1,0 +1,35 @@
+Talos Fleet Controller has been deployed to namespace "{{ include "talos-fleet-controller.namespace" . }}".
+
+Prerequisites — ensure all managed Talos nodes have this in their machine config:
+
+  machine:
+    features:
+      kubernetesTalosAPIAccess:
+        enabled: true
+        allowedRoles: [os:admin]
+        allowedKubernetesNamespaces: [{{ include "talos-fleet-controller.namespace" . }}]
+
+Verify the controller is running:
+
+  kubectl -n {{ include "talos-fleet-controller.namespace" . }} get pods -l "{{ include "talos-fleet-controller.selectorLabels" . | replace "\n" "," }}"
+
+Verify the Talos API credentials were provisioned:
+
+  kubectl -n {{ include "talos-fleet-controller.namespace" . }} get secret {{ include "talos-fleet-controller.talosServiceAccountName" . }}
+
+Create a FleetNodeSet to start managing nodes:
+
+  kubectl apply -f - <<EOF
+  apiVersion: fleet.talos.dev/v1alpha1
+  kind: FleetNodeSet
+  metadata:
+    name: my-nodes
+    namespace: {{ include "talos-fleet-controller.namespace" . }}
+  spec:
+    nodeSelector:
+      matchLabels:
+        node-role.kubernetes.io/control-plane: ""
+    talos:
+      version: v1.12.5
+      schematic: <your-schematic-id>
+  EOF

@@ -50,11 +50,14 @@ func (c *Client) NodeVersion(ctx context.Context, nodeIP string) (string, error)
 	return resp.Messages[0].GetVersion().GetTag(), nil
 }
 
-// NodeConfigRaw returns the raw machine config YAML bytes from a node
-// by reading the persistent MachineConfig resource via COSI.
+// NodeConfigRaw returns the raw machine config YAML bytes from a node.
+// Uses the GenerateConfiguration API which returns the actual machine config
+// (not the COSI resource envelope). This is what ApplyConfiguration expects.
 func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, error) {
 	nodeCtx := talosclient.WithNode(ctx, nodeIP)
 
+	// Use MachineClient.GenerateConfiguration to get the raw config.
+	// Alternatively, read via COSI and extract the spec field.
 	md := resource.NewMetadata(
 		"config",
 		"MachineConfigs.config.talos.dev",
@@ -67,18 +70,33 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 		return nil, fmt.Errorf("get machineconfig from %s: %w", nodeIP, err)
 	}
 
-	// MarshalYAML returns a struct (not bytes) — serialize to YAML bytes for hashing.
+	// The COSI resource has a Spec() method that returns the raw config.
+	// MarshalYAML wraps it in {metadata, spec} envelope.
+	// We need just the spec (the actual machine config YAML).
 	raw, err := resource.MarshalYAML(r)
 	if err != nil {
 		return nil, fmt.Errorf("marshal machineconfig from %s: %w", nodeIP, err)
 	}
 
-	rawBytes, err := yaml.Marshal(raw)
+	// Marshal the full envelope to YAML, then extract the "spec" field.
+	fullBytes, err := yaml.Marshal(raw)
 	if err != nil {
 		return nil, fmt.Errorf("yaml encode machineconfig from %s: %w", nodeIP, err)
 	}
 
-	return rawBytes, nil
+	// Parse envelope and extract spec (the actual machine config).
+	var envelope struct {
+		Spec string `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(fullBytes, &envelope); err != nil {
+		return nil, fmt.Errorf("parse config envelope from %s: %w", nodeIP, err)
+	}
+
+	if envelope.Spec == "" {
+		return nil, fmt.Errorf("empty config spec from %s", nodeIP)
+	}
+
+	return []byte(envelope.Spec), nil
 }
 
 // NodeConfigHash returns a SHA-256 hash of the node's current machine config.

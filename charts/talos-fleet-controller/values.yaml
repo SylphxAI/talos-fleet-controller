@@ -1,0 +1,145 @@
+# Talos Fleet Controller Helm values.
+
+# -- Number of controller replicas. Only one is active at a time (leader election).
+replicaCount: 1
+
+image:
+  # -- Container image repository.
+  repository: ghcr.io/sylphxai/talos-fleet-controller
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (defaults to Chart appVersion).
+  tag: ""
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the release name.
+nameOverride: ""
+# -- Override the full release name.
+fullnameOverride: ""
+
+namespace:
+  # -- Create the namespace. Set to false if the namespace already exists.
+  create: true
+  # -- Namespace where the controller is deployed.
+  name: tfc-system
+  # -- Pod Security Standard enforcement level for the namespace.
+  podSecurityEnforce: privileged
+
+serviceAccount:
+  # -- Create the Kubernetes ServiceAccount.
+  create: true
+  # -- Annotations to add to the ServiceAccount.
+  annotations: {}
+
+rbac:
+  # -- Create ClusterRole and ClusterRoleBinding.
+  create: true
+
+talosServiceAccount:
+  # -- Create the Talos ServiceAccount CRD resource for Talos API access.
+  create: true
+  # -- Name of the Talos ServiceAccount (also the name of the auto-generated Secret).
+  name: tfc-talos-api
+  # -- Talos API roles granted to the controller.
+  roles:
+    - os:admin
+
+controller:
+  # -- Enable leader election for HA deployments.
+  leaderElect: true
+  # -- Bind address for health probes.
+  healthProbeBindAddress: ":8081"
+  # -- Bind address for Prometheus metrics.
+  metricsBindAddress: ":8080"
+  # -- Serve metrics over TLS.
+  metricsSecure: false
+  # -- Extra arguments passed to the controller binary.
+  extraArgs: []
+  # -- Extra environment variables for the controller container.
+  extraEnv: []
+
+resources:
+  requests:
+    # -- CPU request.
+    cpu: 50m
+    # -- Memory request.
+    memory: 64Mi
+  limits:
+    # -- CPU limit.
+    cpu: 500m
+    # -- Memory limit.
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  # -- Seconds before the first liveness check.
+  initialDelaySeconds: 15
+  # -- Interval between liveness checks.
+  periodSeconds: 20
+  # -- Seconds before the probe times out.
+  timeoutSeconds: 3
+  # -- Consecutive failures before the container is restarted.
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  # -- Seconds before the first readiness check.
+  initialDelaySeconds: 5
+  # -- Interval between readiness checks.
+  periodSeconds: 10
+  # -- Seconds before the probe times out.
+  timeoutSeconds: 3
+  # -- Consecutive failures before the container is marked unready.
+  failureThreshold: 3
+
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Node selector for pod scheduling.
+nodeSelector: {}
+
+# -- Tolerations for pod scheduling. Defaults include control-plane toleration.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+# -- Affinity rules for pod scheduling.
+affinity: {}
+
+# -- Additional pod annotations.
+podAnnotations: {}
+
+# -- Additional pod labels.
+podLabels: {}
+
+# -- Priority class name for the controller pod.
+priorityClassName: ""
+
+# -- Topology spread constraints for pod scheduling.
+topologySpreadConstraints: []
+
+# -- Termination grace period in seconds.
+terminationGracePeriodSeconds: 30
+
+# -- Extra volumes to add to the pod.
+extraVolumes: []
+
+# -- Extra volume mounts to add to the controller container.
+extraVolumeMounts: []

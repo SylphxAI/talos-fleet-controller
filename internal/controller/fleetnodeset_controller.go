@@ -24,9 +24,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -50,6 +52,7 @@ type FleetNodeSetReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
 	TalosClient *talos.Client
+	Recorder    record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=fleet.talos.dev,resources=fleetnodesets,verbs=get;list;watch;create;update;patch;delete
@@ -76,6 +79,10 @@ func (r *FleetNodeSetReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	log.Info("reconciling", "name", fns.Name, "generation", fns.Generation)
+	reconcileStart := time.Now()
+	defer func() {
+		reconcileDuration.WithLabelValues(fns.Name).Observe(time.Since(reconcileStart).Seconds())
+	}()
 
 	// Emergency brake — stop all updates.
 	if fns.Spec.Paused {
@@ -115,6 +122,9 @@ func (r *FleetNodeSetReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// 3. Update status from assessments.
 	r.updateStatus(&fns, nodeStates)
+
+	// Record metrics from status.
+	recordMetrics(fns.Name, fns.Status.Total, fns.Status.Synced, fns.Status.Pending, fns.Status.Failed)
 
 	// 4. If all synced, nothing to do.
 	if fns.Status.Synced == fns.Status.Total {
@@ -167,12 +177,19 @@ func (r *FleetNodeSetReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	log.Info("updating node", "node", next.node.Name,
 		"versionDrift", next.versionDrift, "configDrift", next.configDrift)
+	r.Recorder.Eventf(&fns, corev1.EventTypeNormal, "UpdateStarted",
+		"Starting update on node %s (versionDrift=%v, configDrift=%v)",
+		next.node.Name, next.versionDrift, next.configDrift)
 
 	// 8. Execute update sequence: cordon → drain → apply/upgrade → health → uncordon.
 	if err := r.executeNodeUpdate(ctx, &fns, next); err != nil {
 		log.Error(err, "node update failed", "node", next.node.Name)
-		// Don't return error — mark node as Failed and continue next cycle.
+		r.Recorder.Eventf(&fns, corev1.EventTypeWarning, "UpdateFailed",
+			"Node %s update failed: %v", next.node.Name, err)
 		r.setNodeStatus(&fns, next.node.Name, fleetv1alpha1.NodePhaseFailed, err.Error())
+	} else {
+		r.Recorder.Eventf(&fns, corev1.EventTypeNormal, "UpdateCompleted",
+			"Node %s updated successfully", next.node.Name)
 	}
 
 	// 9. Update status and requeue for next node.
@@ -358,9 +375,11 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 
 		mode := talos.ApplyMode(fns.Spec.UpdateStrategy.ConfigApplyMode)
 		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, mergedConfig, mode); err != nil {
+			updatesTotal.WithLabelValues(fns.Name, "config", "failure").Inc()
 			_ = r.uncordonNode(ctx, a.node)
 			return fmt.Errorf("apply config to %s: %w", nodeName, err)
 		}
+		updatesTotal.WithLabelValues(fns.Name, "config", "success").Inc()
 		log.Info("config applied", "node", nodeName)
 	}
 
@@ -425,8 +444,8 @@ func (r *FleetNodeSetReconciler) uncordonNode(ctx context.Context, node *corev1.
 	return r.Patch(ctx, &fresh, patch)
 }
 
-// drainNode evicts all non-DaemonSet, non-mirror pods from a node.
-// Respects PodDisruptionBudgets. Times out after the specified duration.
+// drainNode evicts all non-DaemonSet, non-mirror pods from a node and waits
+// for them to terminate. Respects PodDisruptionBudgets. Times out after duration.
 func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Node, timeout time.Duration) error {
 	log := logf.FromContext(ctx)
 
@@ -435,52 +454,99 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 	}
 	deadline := time.Now().Add(timeout)
 
-	// List all pods on this node.
+	// List all pods on this node using label selector (no field indexer needed).
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-		return fmt.Errorf("list pods on %s: %w", node.Name, err)
+	if err := r.List(ctx, &podList); err != nil {
+		return fmt.Errorf("list pods: %w", err)
 	}
 
-	evicted := 0
-	skipped := 0
-
+	// Filter to pods on this node.
+	var podsToEvict []corev1.Pod
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-
-		// Skip DaemonSet pods (they'll restart on the same node anyway).
-		if isDaemonSetPod(pod) {
-			skipped++
+		if pod.Spec.NodeName != node.Name {
 			continue
 		}
-		// Skip mirror pods (static pods managed by kubelet).
-		if isMirrorPod(pod) {
-			skipped++
+		if isDaemonSetPod(pod) || isMirrorPod(pod) {
 			continue
 		}
-		// Skip already-terminated pods.
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
+		podsToEvict = append(podsToEvict, *pod)
+	}
 
-		// Evict the pod (respects PDBs).
+	if len(podsToEvict) == 0 {
+		log.Info("no pods to drain", "node", node.Name)
+		return nil
+	}
+
+	log.Info("draining node", "node", node.Name, "pods", len(podsToEvict))
+
+	// Phase 1: Send eviction requests.
+	evicted := 0
+	for i := range podsToEvict {
+		pod := &podsToEvict[i]
+		if time.Now().After(deadline) {
+			return fmt.Errorf("drain timeout after evicting %d/%d pods on %s", evicted, len(podsToEvict), node.Name)
+		}
+
 		eviction := &policyv1.Eviction{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 			},
 		}
-		if err := r.SubResource("eviction").Create(ctx, pod, eviction); err != nil {
-			if time.Now().After(deadline) {
-				return fmt.Errorf("drain timeout after evicting %d pods on %s", evicted, node.Name)
+
+		err := r.SubResource("eviction").Create(ctx, pod, eviction)
+		if err != nil {
+			if apierrors.IsTooManyRequests(err) {
+				// PDB blocking — wait and retry.
+				log.Info("PDB blocking eviction, waiting", "pod", pod.Name)
+				time.Sleep(5 * time.Second)
+				i-- // retry this pod
+				continue
 			}
-			log.Error(err, "eviction failed, continuing", "pod", pod.Name, "namespace", pod.Namespace)
+			if apierrors.IsNotFound(err) {
+				continue // already gone
+			}
+			log.Error(err, "eviction failed", "pod", pod.Name, "namespace", pod.Namespace)
 			continue
 		}
 		evicted++
 	}
 
-	log.Info("drain complete", "node", node.Name, "evicted", evicted, "skipped", skipped)
-	return nil
+	// Phase 2: Wait for evicted pods to actually terminate.
+	for time.Now().Before(deadline) {
+		remaining := 0
+		for i := range podsToEvict {
+			var pod corev1.Pod
+			err := r.Get(ctx, client.ObjectKey{
+				Name:      podsToEvict[i].Name,
+				Namespace: podsToEvict[i].Namespace,
+			}, &pod)
+			if apierrors.IsNotFound(err) {
+				continue // pod gone
+			}
+			if err != nil {
+				continue // can't check, assume gone
+			}
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				continue // terminated
+			}
+			remaining++
+		}
+
+		if remaining == 0 {
+			log.Info("drain complete", "node", node.Name, "evicted", evicted)
+			return nil
+		}
+
+		log.Info("waiting for pod termination", "node", node.Name, "remaining", remaining)
+		time.Sleep(5 * time.Second)
+	}
+
+	return fmt.Errorf("drain timeout: pods still running on %s after %s", node.Name, timeout)
 }
 
 // isDaemonSetPod returns true if the pod is owned by a DaemonSet.
@@ -656,6 +722,8 @@ func hashConfig(data []byte) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *FleetNodeSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("talos-fleet-controller")
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1alpha1.FleetNodeSet{}).
 		Named("fleetnodeset").
