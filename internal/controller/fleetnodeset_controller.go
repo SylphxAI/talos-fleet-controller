@@ -23,6 +23,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -423,13 +425,78 @@ func (r *FleetNodeSetReconciler) uncordonNode(ctx context.Context, node *corev1.
 	return r.Patch(ctx, &fresh, patch)
 }
 
-// drainNode evicts all pods from a node, respecting PDBs.
+// drainNode evicts all non-DaemonSet, non-mirror pods from a node.
+// Respects PodDisruptionBudgets. Times out after the specified duration.
 func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Node, timeout time.Duration) error {
-	// TODO: implement proper drain with PDB respect and timeout.
-	// For v0.1.0, we cordon only — drain will be added in v0.2.0.
-	// Cordon prevents new pods; existing pods continue running.
-	// The upgrade/apply-config process handles pod restart via node reboot if needed.
+	log := logf.FromContext(ctx)
+
+	if timeout == 0 {
+		timeout = 300 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+
+	// List all pods on this node.
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+		return fmt.Errorf("list pods on %s: %w", node.Name, err)
+	}
+
+	evicted := 0
+	skipped := 0
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+
+		// Skip DaemonSet pods (they'll restart on the same node anyway).
+		if isDaemonSetPod(pod) {
+			skipped++
+			continue
+		}
+		// Skip mirror pods (static pods managed by kubelet).
+		if isMirrorPod(pod) {
+			skipped++
+			continue
+		}
+		// Skip already-terminated pods.
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+
+		// Evict the pod (respects PDBs).
+		eviction := &policyv1.Eviction{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+			},
+		}
+		if err := r.SubResource("eviction").Create(ctx, pod, eviction); err != nil {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("drain timeout after evicting %d pods on %s", evicted, node.Name)
+			}
+			log.Error(err, "eviction failed, continuing", "pod", pod.Name, "namespace", pod.Namespace)
+			continue
+		}
+		evicted++
+	}
+
+	log.Info("drain complete", "node", node.Name, "evicted", evicted, "skipped", skipped)
 	return nil
+}
+
+// isDaemonSetPod returns true if the pod is owned by a DaemonSet.
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+// isMirrorPod returns true if the pod is a static/mirror pod.
+func isMirrorPod(pod *corev1.Pod) bool {
+	_, ok := pod.Annotations["kubernetes.io/config.mirror"]
+	return ok
 }
 
 // waitNodeReady polls until the node's Ready condition is True or timeout.
