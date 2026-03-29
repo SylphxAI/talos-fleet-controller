@@ -35,11 +35,7 @@ spec:
           topolvm.io/node: "true"
         sysctls:
           net.ipv6.conf.all.forwarding: "1"
-        features:
-          kubernetesTalosAPIAccess:
-            enabled: true
-            allowedRoles: [os:admin]
-            allowedKubernetesNamespaces: [tfc-system]
+        # kubernetesTalosAPIAccess is CP-only — workers accessed via Talos API proxy on CPs
       cluster:
         controlPlane:
           endpoint: https://10.10.0.240:6443
