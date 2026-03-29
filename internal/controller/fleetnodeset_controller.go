@@ -264,64 +264,40 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Drift detection: normalized comparison.
+	// Drift detection: compare desired PATCH hash, not node config.
 	//
-	// Both current and merged configs go through the same serialization path
-	// (NewFromBytes → EncodeBytes) for a fair, deterministic comparison.
-	// If the patch changes nothing → bytes are identical → no drift → no apply.
-	// This eliminates false drift from serialization differences and prevents
-	// unnecessary applies that could cause service disruption.
+	// Trying to predict what a node's config will look like after apply
+	// is unreliable — Talos normalizes config internally, Clone() changes
+	// field ordering, and EncodeBytes() is not deterministic across paths.
 	//
-	// Additionally, we store lastAppliedConfigHash to detect external drift
-	// (someone changed config outside TFC).
+	// Instead, we use the Terraform pattern:
+	//   desiredPatchHash = hash(patch we want to apply)
+	//   lastAppliedPatchHash = hash stored in status after last successful apply
+	//   If equal → already applied this exact patch → Synced
+	//   If different → CRD spec changed or never applied → Apply
+	//
+	// This is simple, reliable, and fully deterministic — the patch bytes
+	// come directly from the FleetNodeSet spec, not from config parsing.
 
-	currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
-	if err != nil {
-		log.Error(err, "failed to get config", "node", node.Name)
-		a.err = err
-		return a
-	}
-
-	// Normalize current config through EncodeBytes (same path as merged).
-	normalizedCurrent, err := configToBytes(currentProvider)
-	if err != nil {
-		a.err = fmt.Errorf("normalize current config for %s: %w", node.Name, err)
-		return a
-	}
-	a.currentHash = hashConfig(normalizedCurrent)
-
-	// Build patch and apply to current config.
 	desiredPatch, err := r.buildDesiredPatch(fns, node)
 	if err != nil {
 		a.err = err
 		return a
 	}
+	a.desiredHash = hashConfig(desiredPatch)
 
-	mergedProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
-	if err != nil {
-		a.err = fmt.Errorf("compute drift for %s: %w", node.Name, err)
-		return a
-	}
-
-	normalizedMerged, err := configToBytes(mergedProvider)
-	if err != nil {
-		a.err = fmt.Errorf("normalize merged config for %s: %w", node.Name, err)
-		return a
-	}
-	a.desiredHash = hashConfig(normalizedMerged)
-
-	// Fair comparison: both went through Provider → EncodeBytes.
-	// If equal, the patch changes nothing → no drift.
-	a.configDrift = (a.currentHash != a.desiredHash)
-
-	// Secondary check: detect external drift (config changed outside TFC).
-	if !a.configDrift {
-		lastApplied := r.getNodeLastApplied(fns, node.Name)
-		if lastApplied != nil && lastApplied.LastAppliedConfigHash != "" {
-			rawHash := hashConfig(normalizedCurrent)
-			if rawHash != lastApplied.LastAppliedConfigHash {
-				log.Info("external config change detected (but matches desired state)", "node", node.Name)
-			}
+	// Check if we already applied this exact patch to this node.
+	lastApplied := r.getNodeLastApplied(fns, node.Name)
+	if lastApplied != nil && lastApplied.LastAppliedConfigHash == a.desiredHash {
+		// Same patch already applied → Synced.
+		a.configDrift = false
+		a.currentHash = a.desiredHash
+	} else {
+		// Never applied, or CRD spec changed → drift.
+		a.configDrift = true
+		a.currentHash = ""
+		if lastApplied != nil {
+			a.currentHash = lastApplied.LastAppliedConfigHash
 		}
 	}
 
@@ -452,20 +428,14 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		return fmt.Errorf("uncordon %s: %w", nodeName, err)
 	}
 
-	// Done — re-read config hash from the node POST-APPLY to store as lastApplied.
-	// This is the hash that Talos stores internally after normalization.
-	// Future drift checks compare against this, not against our "would-be" output.
-	postApplyRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
-	postApplyHash := ""
-	if err == nil {
-		postApplyHash = hashConfig(postApplyRaw)
-	} else {
-		log.Error(err, "failed to read post-apply config hash (non-fatal)", "node", nodeName)
-	}
+	// Store the PATCH hash (not node config hash) — this is what we compare
+	// on subsequent cycles to determine if the CRD spec changed.
+	desiredPatch, _ := r.buildDesiredPatch(fns, a.node)
+	patchHash := hashConfig(desiredPatch)
 
 	now := time.Now()
-	r.setNodeStatusSynced(fns, nodeName, fns.Spec.Talos.Version, postApplyHash, fns.Generation, &now)
-	log.Info("node updated successfully", "node", nodeName, "postApplyHash", postApplyHash)
+	r.setNodeStatusSynced(fns, nodeName, fns.Spec.Talos.Version, patchHash, fns.Generation, &now)
+	log.Info("node updated successfully", "node", nodeName)
 
 	return nil
 }
