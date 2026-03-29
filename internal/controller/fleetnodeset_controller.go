@@ -264,47 +264,65 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Drift detection using last-applied hash pattern.
+	// Drift detection: normalized comparison.
 	//
-	// The "would-be" comparison (hash(current) vs hash(patched)) doesn't work
-	// because Talos normalizes config internally after apply — the stored config
-	// will never byte-match our configpatcher output, causing infinite re-apply.
+	// Both current and merged configs go through the same serialization path
+	// (NewFromBytes → EncodeBytes) for a fair, deterministic comparison.
+	// If the patch changes nothing → bytes are identical → no drift → no apply.
+	// This eliminates false drift from serialization differences and prevents
+	// unnecessary applies that could cause service disruption.
 	//
-	// Instead, we use the kubectl last-applied-configuration pattern:
-	// - After successful apply: re-read config hash → store as lastAppliedConfigHash
-	// - On each cycle: if currentHash == lastAppliedHash AND generation unchanged → synced
-	// - If generation advanced → re-apply (desired config changed in CRD)
-	// - If currentHash != lastAppliedHash → external drift (someone changed config outside TFC)
+	// Additionally, we store lastAppliedConfigHash to detect external drift
+	// (someone changed config outside TFC).
 
-	currentRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
+	currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
 	if err != nil {
 		log.Error(err, "failed to get config", "node", node.Name)
 		a.err = err
 		return a
 	}
-	a.currentHash = hashConfig(currentRaw)
 
-	// Look up this node's last-applied status.
-	lastApplied := r.getNodeLastApplied(fns, node.Name)
+	// Normalize current config through EncodeBytes (same path as merged).
+	normalizedCurrent, err := configToBytes(currentProvider)
+	if err != nil {
+		a.err = fmt.Errorf("normalize current config for %s: %w", node.Name, err)
+		return a
+	}
+	a.currentHash = hashConfig(normalizedCurrent)
 
-	if lastApplied != nil && lastApplied.LastAppliedConfigHash != "" {
-		// We have a record of a previous apply.
-		if lastApplied.LastAppliedGeneration == fns.Generation {
-			// Same generation — check if config drifted externally.
-			a.configDrift = (a.currentHash != lastApplied.LastAppliedConfigHash)
-			a.desiredHash = lastApplied.LastAppliedConfigHash
-			if a.configDrift {
-				log.Info("external config drift detected", "node", node.Name)
+	// Build patch and apply to current config.
+	desiredPatch, err := r.buildDesiredPatch(fns, node)
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	mergedProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
+	if err != nil {
+		a.err = fmt.Errorf("compute drift for %s: %w", node.Name, err)
+		return a
+	}
+
+	normalizedMerged, err := configToBytes(mergedProvider)
+	if err != nil {
+		a.err = fmt.Errorf("normalize merged config for %s: %w", node.Name, err)
+		return a
+	}
+	a.desiredHash = hashConfig(normalizedMerged)
+
+	// Fair comparison: both went through Provider → EncodeBytes.
+	// If equal, the patch changes nothing → no drift.
+	a.configDrift = (a.currentHash != a.desiredHash)
+
+	// Secondary check: detect external drift (config changed outside TFC).
+	if !a.configDrift {
+		lastApplied := r.getNodeLastApplied(fns, node.Name)
+		if lastApplied != nil && lastApplied.LastAppliedConfigHash != "" {
+			rawHash := hashConfig(normalizedCurrent)
+			if rawHash != lastApplied.LastAppliedConfigHash {
+				log.Info("external config change detected (but matches desired state)", "node", node.Name)
 			}
-		} else {
-			// Generation advanced — CRD spec changed, must re-apply.
-			a.configDrift = true
-			a.desiredHash = "generation-advanced"
 		}
-	} else {
-		// Never applied — always drift.
-		a.configDrift = true
-		a.desiredHash = "never-applied"
 	}
 
 	return a
