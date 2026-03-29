@@ -95,10 +95,11 @@ func mergePatches(base, overlay string) ([]byte, error) {
 		[]configpatcher.Patch{overlayPatch},
 	)
 	if err != nil {
-		// If sequential apply fails, try just returning the overlay
-		// (base might not be a valid standalone config).
+		// H2: Return the error instead of silently dropping the base config.
+		// The old code swallowed the error and returned only the overlay, which
+		// meant base config fields were silently lost when merge failed.
 		_ = basePatch
-		return []byte(overlay), nil
+		return nil, fmt.Errorf("apply overlay on base: %w", err)
 	}
 
 	return output.Bytes()

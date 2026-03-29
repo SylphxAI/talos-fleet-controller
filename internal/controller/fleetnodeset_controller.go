@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"time"
 
-	"strings"
-
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"go.yaml.in/yaml/v3"
+
 	fleetv1alpha1 "github.com/SylphxAI/talos-fleet-controller/api/v1alpha1"
 	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
 )
@@ -45,6 +45,18 @@ const (
 
 	// requeueProgressingInterval is the requeue interval when an update is in progress.
 	requeueProgressingInterval = 10 * time.Second
+
+	// annotationUpdateStarted marks that the controller has started an update on this node.
+	// Contains a RFC3339 timestamp. Used for orphaned cordon recovery after controller crashes. (C1)
+	annotationUpdateStarted = "fleet.talos.dev/update-started"
+
+	// annotationManagedBy marks which FleetNodeSet is managing this node.
+	// Value is "<namespace>/<name>". Used to prevent overlapping FleetNodeSet conflicts. (C2)
+	annotationManagedBy = "fleet.talos.dev/managed-by"
+
+	// upgradeHealthCheckTimeout is the default health check timeout for upgrade operations.
+	// Upgrades involve a full reboot cycle and take longer than config applies. (H4)
+	upgradeHealthCheckTimeout = 600 * time.Second
 )
 
 // FleetNodeSetReconciler reconciles a FleetNodeSet object.
@@ -53,7 +65,7 @@ const (
 type FleetNodeSetReconciler struct {
 	client.Client
 	Scheme      *runtime.Scheme
-	TalosClient *talos.Client
+	TalosClient talos.Interface
 	Recorder    record.EventRecorder
 }
 
@@ -85,6 +97,15 @@ func (r *FleetNodeSetReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	defer func() {
 		reconcileDuration.WithLabelValues(fns.Name).Observe(time.Since(reconcileStart).Seconds())
 	}()
+
+	// C1: Orphaned cordon recovery — scan for nodes with our update-started
+	// annotation that are cordoned but not being actively updated. This handles
+	// the case where the controller crashed mid-update, leaving a node cordoned.
+	fnsKey := fmt.Sprintf("%s/%s", fns.Namespace, fns.Name)
+	if err := r.recoverOrphanedCordons(ctx, &fns, fnsKey); err != nil {
+		log.Error(err, "orphaned cordon recovery failed")
+		// Non-fatal — continue with reconciliation.
+	}
 
 	// Emergency brake — stop all updates.
 	if fns.Spec.Paused {
@@ -249,6 +270,15 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 		isUpdating: node.Spec.Unschedulable, // cordoned = updating
 	}
 
+	// C2: Check if this node is managed by another FleetNodeSet.
+	fnsKey := fmt.Sprintf("%s/%s", fns.Namespace, fns.Name)
+	if managedBy, ok := node.Annotations[annotationManagedBy]; ok && managedBy != fnsKey {
+		a.err = fmt.Errorf("node %s managed by another FleetNodeSet: %s", node.Name, managedBy)
+		log.Error(a.err, "skipping node managed by another FleetNodeSet",
+			"node", node.Name, "managedBy", managedBy, "self", fnsKey)
+		return a
+	}
+
 	// Get node internal IP for Talos API access.
 	a.nodeIP = nodeInternalIP(node)
 	if a.nodeIP == "" {
@@ -347,17 +377,38 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		log.Info("etcd quorum OK", "members", members, "node", nodeName)
 	}
 
+	// C2: Set managed-by annotation before starting update.
+	fnsKey := fmt.Sprintf("%s/%s", fns.Namespace, fns.Name)
+	if err := r.setManagedByAnnotation(ctx, a.node, fnsKey); err != nil {
+		return fmt.Errorf("set managed-by annotation on %s: %w", nodeName, err)
+	}
+
+	// C1: Set update-started annotation with timestamp before cordoning.
+	if err := r.setUpdateAnnotation(ctx, a.node); err != nil {
+		return fmt.Errorf("set update annotation on %s: %w", nodeName, err)
+	}
+
 	// Step 1: Cordon.
 	r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseCordoning, "Cordoning node")
 	if err := r.cordonNode(ctx, a.node); err != nil {
+		_ = r.removeUpdateAnnotation(ctx, a.node)
 		return fmt.Errorf("cordon %s: %w", nodeName, err)
 	}
 
 	// Step 2: Drain.
 	r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseDraining, "Draining workloads")
 	if err := r.drainNode(ctx, a.node, fns.Spec.UpdateStrategy.DrainTimeout.Duration); err != nil {
-		// Drain failure is non-fatal — log and continue (PDB may block).
-		log.Error(err, "drain incomplete, proceeding", "node", nodeName)
+		// C3: Drain failure is fatal for reboot mode — we must not reboot a node
+		// with workloads still running. For no-reboot and staged modes, drain
+		// failure is non-fatal since the node stays up after config apply.
+		mode := talos.ApplyMode(fns.Spec.UpdateStrategy.ConfigApplyMode)
+		if mode == talos.ApplyModeReboot || mode == talos.ApplyModeAuto {
+			log.Error(err, "drain failed in reboot-capable mode, aborting update", "node", nodeName, "mode", mode)
+			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
+			return fmt.Errorf("drain %s: %w (fatal for %s mode)", nodeName, err, mode)
+		}
+		log.Error(err, "drain incomplete, proceeding (non-reboot mode)", "node", nodeName, "mode", mode)
 	}
 
 	// Step 3: Apply config if drifted.
@@ -368,6 +419,7 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		desiredPatch, err := r.buildDesiredPatch(fns, a.node)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("build config patch for %s: %w", nodeName, err)
 		}
 
@@ -375,6 +427,7 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		currentProvider, err := r.TalosClient.NodeConfigProvider(ctx, a.nodeIP)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("read current config from %s: %w", nodeName, err)
 		}
 
@@ -382,6 +435,7 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		patchedProvider, err := applyPatchToConfig(currentProvider, desiredPatch)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("apply config patch for %s: %w", nodeName, err)
 		}
 
@@ -389,6 +443,7 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		mergedConfig, err := configToBytes(patchedProvider)
 		if err != nil {
 			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("encode patched config for %s: %w", nodeName, err)
 		}
 
@@ -406,6 +461,7 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, mergedConfig, mode); err != nil {
 			updatesTotal.WithLabelValues(fns.Name, "config", "failure").Inc()
 			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("apply config to %s: %w", nodeName, err)
 		}
 		updatesTotal.WithLabelValues(fns.Name, "config", "success").Inc()
@@ -418,9 +474,12 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		installerImage := fmt.Sprintf("%s/installer/%s:%s",
 			fns.Spec.Talos.FactoryURL, fns.Spec.Talos.Schematic, fns.Spec.Talos.Version)
 		if err := r.TalosClient.Upgrade(ctx, a.nodeIP, installerImage); err != nil {
-			_ = r.uncordonNode(ctx, a.node) // best-effort uncordon on failure
+			updatesTotal.WithLabelValues(fns.Name, "upgrade", "failure").Inc() // H4: upgrade metrics
+			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
 			return fmt.Errorf("upgrade %s: %w", nodeName, err)
 		}
+		updatesTotal.WithLabelValues(fns.Name, "upgrade", "success").Inc() // H4: upgrade metrics
 		log.Info("upgrade started", "node", nodeName, "image", installerImage)
 	}
 
@@ -430,19 +489,35 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 	if timeout == 0 {
 		timeout = 120 * time.Second
 	}
+	// H4: Use longer timeout for upgrades since they involve full reboot cycles.
+	if a.versionDrift && timeout < upgradeHealthCheckTimeout {
+		timeout = upgradeHealthCheckTimeout
+	}
 	if err := r.waitNodeReady(ctx, a.node.Name, timeout); err != nil {
 		_ = r.uncordonNode(ctx, a.node)
+		_ = r.removeUpdateAnnotation(ctx, a.node)
 		return fmt.Errorf("health check %s: %w", nodeName, err)
 	}
 
 	// Step 6: Uncordon.
 	if err := r.uncordonNode(ctx, a.node); err != nil {
+		_ = r.removeUpdateAnnotation(ctx, a.node)
 		return fmt.Errorf("uncordon %s: %w", nodeName, err)
 	}
 
-	// Store the PATCH hash (not node config hash) — this is what we compare
+	// C1: Remove update-started annotation after successful uncordon.
+	if err := r.removeUpdateAnnotation(ctx, a.node); err != nil {
+		log.Error(err, "failed to remove update annotation, will be cleaned on next reconcile", "node", nodeName)
+	}
+
+	// C4: Store the PATCH hash (not node config hash) — this is what we compare
 	// on subsequent cycles to determine if the CRD spec changed.
-	desiredPatch, _ := r.buildDesiredPatch(fns, a.node)
+	// Handle the error instead of swallowing it — use empty hash on failure.
+	desiredPatch, err := r.buildDesiredPatch(fns, a.node)
+	if err != nil {
+		log.Error(err, "buildDesiredPatch failed on success path, using empty hash", "node", nodeName)
+		desiredPatch = []byte{}
+	}
 	patchHash := hashConfig(desiredPatch)
 
 	now := time.Now()
@@ -477,6 +552,107 @@ func (r *FleetNodeSetReconciler) uncordonNode(ctx context.Context, node *corev1.
 	return r.Patch(ctx, &fresh, patch)
 }
 
+// recoverOrphanedCordons uncordons nodes that have the update-started annotation
+// but are cordoned without an active update in progress. This handles the case
+// where the controller crashed after cordoning but before uncordoning. (C1)
+func (r *FleetNodeSetReconciler) recoverOrphanedCordons(ctx context.Context, fns *fleetv1alpha1.FleetNodeSet, fnsKey string) error {
+	log := logf.FromContext(ctx)
+
+	nodes, err := r.selectNodes(ctx, fns.Spec.NodeSelector)
+	if err != nil {
+		return fmt.Errorf("select nodes for orphan recovery: %w", err)
+	}
+
+	for i := range nodes {
+		node := &nodes[i]
+
+		// Only recover nodes that have our update-started annotation.
+		startedTS, hasAnnotation := node.Annotations[annotationUpdateStarted]
+		if !hasAnnotation {
+			continue
+		}
+
+		// Only recover nodes that belong to this FleetNodeSet.
+		managedBy, hasManagedBy := node.Annotations[annotationManagedBy]
+		if hasManagedBy && managedBy != fnsKey {
+			continue
+		}
+
+		// Only recover nodes that are currently cordoned.
+		if !node.Spec.Unschedulable {
+			continue
+		}
+
+		log.Info("recovering orphaned cordon",
+			"node", node.Name,
+			"updateStarted", startedTS,
+			"cordoned", node.Spec.Unschedulable)
+
+		// Uncordon the node and remove the update-started annotation.
+		if err := r.uncordonNode(ctx, node); err != nil {
+			log.Error(err, "failed to uncordon orphaned node", "node", node.Name)
+			continue
+		}
+
+		if err := r.removeUpdateAnnotation(ctx, node); err != nil {
+			log.Error(err, "failed to remove update annotation from orphaned node", "node", node.Name)
+			continue
+		}
+
+		r.Recorder.Eventf(fns, corev1.EventTypeWarning, "OrphanRecovered",
+			"Recovered orphaned cordon on node %s (update started at %s)", node.Name, startedTS)
+	}
+
+	return nil
+}
+
+// setUpdateAnnotation adds the update-started annotation with current timestamp
+// to track that this controller is actively updating the node. (C1)
+func (r *FleetNodeSetReconciler) setUpdateAnnotation(ctx context.Context, node *corev1.Node) error {
+	var fresh corev1.Node
+	if err := r.Get(ctx, client.ObjectKeyFromObject(node), &fresh); err != nil {
+		return err
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	if fresh.Annotations == nil {
+		fresh.Annotations = make(map[string]string)
+	}
+	fresh.Annotations[annotationUpdateStarted] = time.Now().UTC().Format(time.RFC3339)
+	return r.Patch(ctx, &fresh, patch)
+}
+
+// removeUpdateAnnotation removes the update-started annotation after
+// a successful update or during orphan recovery. (C1)
+func (r *FleetNodeSetReconciler) removeUpdateAnnotation(ctx context.Context, node *corev1.Node) error {
+	var fresh corev1.Node
+	if err := r.Get(ctx, client.ObjectKeyFromObject(node), &fresh); err != nil {
+		return err
+	}
+	if _, ok := fresh.Annotations[annotationUpdateStarted]; !ok {
+		return nil // annotation already absent
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	delete(fresh.Annotations, annotationUpdateStarted)
+	return r.Patch(ctx, &fresh, patch)
+}
+
+// setManagedByAnnotation marks the node as managed by the given FleetNodeSet. (C2)
+func (r *FleetNodeSetReconciler) setManagedByAnnotation(ctx context.Context, node *corev1.Node, fnsKey string) error {
+	var fresh corev1.Node
+	if err := r.Get(ctx, client.ObjectKeyFromObject(node), &fresh); err != nil {
+		return err
+	}
+	if fresh.Annotations != nil && fresh.Annotations[annotationManagedBy] == fnsKey {
+		return nil // already set correctly
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	if fresh.Annotations == nil {
+		fresh.Annotations = make(map[string]string)
+	}
+	fresh.Annotations[annotationManagedBy] = fnsKey
+	return r.Patch(ctx, &fresh, patch)
+}
+
 // drainNode evicts all non-DaemonSet, non-mirror pods from a node and waits
 // for them to terminate. Respects PodDisruptionBudgets. Times out after duration.
 func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Node, timeout time.Duration) error {
@@ -487,19 +663,17 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 	}
 	deadline := time.Now().Add(timeout)
 
-	// List all pods on this node using label selector (no field indexer needed).
+	// H1: Use field indexer for spec.nodeName to list only pods on this node,
+	// instead of listing all pods in the cluster and filtering client-side.
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList); err != nil {
-		return fmt.Errorf("list pods: %w", err)
+	if err := r.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+		return fmt.Errorf("list pods on node %s: %w", node.Name, err)
 	}
 
-	// Filter to pods on this node.
+	// Filter out DaemonSet pods, mirror pods, and already-terminated pods.
 	var podsToEvict []corev1.Pod
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Spec.NodeName != node.Name {
-			continue
-		}
 		if isDaemonSetPod(pod) || isMirrorPod(pod) {
 			continue
 		}
@@ -624,13 +798,18 @@ func (r *FleetNodeSetReconciler) updateStatus(fns *fleetv1alpha1.FleetNodeSet, a
 	fns.Status.Progressing = 0
 	fns.Status.Pending = 0
 	fns.Status.Failed = 0
-	fns.Status.Nodes = make([]fleetv1alpha1.FleetNodeStatus, 0, len(assessments))
 
-	// Build a map of existing node statuses to preserve lastApplied fields.
+	// C5: Build the map of existing node statuses BEFORE replacing the slice.
+	// The old code replaced Nodes with an empty slice first, then iterated the
+	// (now empty) slice to build the map — losing all lastApplied data on every
+	// reconcile cycle. This caused perpetual config drift detection.
 	existingStatus := make(map[string]*fleetv1alpha1.FleetNodeStatus)
 	for i := range fns.Status.Nodes {
 		existingStatus[fns.Status.Nodes[i].Name] = &fns.Status.Nodes[i]
 	}
+
+	// Now replace the slice with fresh data.
+	fns.Status.Nodes = make([]fleetv1alpha1.FleetNodeStatus, 0, len(assessments))
 
 	for _, a := range assessments {
 		ns := fleetv1alpha1.FleetNodeStatus{
@@ -715,24 +894,37 @@ func (r *FleetNodeSetReconciler) getNodeLastApplied(fns *fleetv1alpha1.FleetNode
 // bind mounts are not cleaned up, causing ENOSPC on re-mount.
 // See: https://github.com/siderolabs/talos/issues/13053
 //
+// H6: Parse the YAML into a structured map and check for machine.kubelet keys
+// instead of naive string matching, which could false-positive on comments or
+// unrelated fields that happen to contain "kubelet:" as a substring.
+//
 // When detected, TFC uses "reboot" mode instead of "auto" to safely clear
 // all mount namespaces via full reboot.
 func configAffectsKubelet(patchYAML []byte) bool {
-	patchStr := string(patchYAML)
-	kubeletFields := []string{
-		"kubelet:",
-		"extraArgs:",
-		"extraMounts:",
-		"extraConfig:",
-		"clusterDNS:",
-		"nodeIP:",
+	if len(patchYAML) == 0 {
+		return false
 	}
-	for _, field := range kubeletFields {
-		if strings.Contains(patchStr, field) {
-			return true
-		}
+
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(patchYAML, &doc); err != nil {
+		// If we can't parse the YAML, fall back to conservative behavior
+		// (assume it might affect kubelet to be safe).
+		return true
 	}
-	return false
+
+	// Navigate to machine.kubelet in the parsed YAML tree.
+	machine, ok := doc["machine"]
+	if !ok {
+		return false
+	}
+
+	machineMap, ok := machine.(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	_, hasKubelet := machineMap["kubelet"]
+	return hasKubelet
 }
 
 // --- Node helpers ---
@@ -806,6 +998,26 @@ func hashConfig(data []byte) string {
 // SetupWithManager sets up the controller with the Manager.
 func (r *FleetNodeSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("talos-fleet-controller") //nolint:staticcheck // GetEventRecorder not yet available in v0.23
+
+	// H1: Register field indexer for spec.nodeName so drainNode can efficiently
+	// list pods on a specific node without fetching all pods in the cluster.
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&corev1.Pod{},
+		"spec.nodeName",
+		func(obj client.Object) []string {
+			pod, ok := obj.(*corev1.Pod)
+			if !ok {
+				return nil
+			}
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		},
+	); err != nil {
+		return fmt.Errorf("register spec.nodeName field indexer: %w", err)
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1alpha1.FleetNodeSet{}).
