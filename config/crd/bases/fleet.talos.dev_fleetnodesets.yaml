@@ -1,0 +1,473 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: fleetnodesets.fleet.talos.dev
+spec:
+  group: fleet.talos.dev
+  names:
+    kind: FleetNodeSet
+    listKind: FleetNodeSetList
+    plural: fleetnodesets
+    singular: fleetnodeset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.total
+      name: Total
+      type: integer
+    - jsonPath: .status.synced
+      name: Synced
+      type: integer
+    - jsonPath: .status.progressing
+      name: Progressing
+      type: integer
+    - jsonPath: .spec.talos.version
+      name: Talos
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          FleetNodeSet is the Schema for the fleetnodesets API.
+          It declares the desired Talos OS version and machine configuration
+          for a set of nodes. The TFC controller reconciles actual state to
+          match, performing sequential upgrades and config applies with
+          safety guarantees (etcd quorum, drain, health checks).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state.
+            properties:
+              dryRun:
+                description: dryRun computes diffs and reports status without applying
+                  changes.
+                type: boolean
+              machineConfig:
+                description: |-
+                  machineConfig is the base machine config patch applied to all
+                  matching nodes. Per-node differences are handled by nodeOverrides.
+                properties:
+                  inline:
+                    description: |-
+                      inline is a raw YAML strategic merge patch applied to the machine config.
+                      Cluster secrets (CA, etcd, SA key) are never touched — only machine.*
+                      and cluster.controlPlane.endpoint fields are patched.
+                    type: string
+                  secretRef:
+                    description: |-
+                      secretRef references a Secret containing a machine config patch
+                      under the key "machineConfig". Use this for configs containing
+                      sensitive values (registry credentials, etc.).
+                    properties:
+                      name:
+                        description: name is the name of the Secret.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
+              maintenanceWindow:
+                description: |-
+                  maintenanceWindow restricts when updates may start.
+                  If unset, updates proceed immediately.
+                properties:
+                  duration:
+                    description: |-
+                      duration is how long the maintenance window stays open.
+                      Updates in progress when the window closes will complete.
+                    type: string
+                  schedule:
+                    description: |-
+                      schedule is a cron expression defining when updates may start.
+                      Uses standard 5-field cron syntax (minute hour day month weekday).
+                    type: string
+                required:
+                - duration
+                - schedule
+                type: object
+              nodeOverrides:
+                description: |-
+                  nodeOverrides are per-node config patches merged on top of the
+                  base machineConfig. Use for node-specific fields (IP, MAC, hostname).
+                items:
+                  description: |-
+                    NodeOverride defines per-node config patches for fields that differ
+                    between nodes (IP, MAC, hostname). Merged on top of the base machineConfig.
+                  properties:
+                    machineConfig:
+                      description: |-
+                        machineConfig is a strategic merge patch applied on top of the base
+                        machineConfig for matching nodes. Used for per-node fields like
+                        hostname, MAC address, VLAN IP, IPv6 prefix.
+                      properties:
+                        inline:
+                          description: |-
+                            inline is a raw YAML strategic merge patch applied to the machine config.
+                            Cluster secrets (CA, etcd, SA key) are never touched — only machine.*
+                            and cluster.controlPlane.endpoint fields are patched.
+                          type: string
+                        secretRef:
+                          description: |-
+                            secretRef references a Secret containing a machine config patch
+                            under the key "machineConfig". Use this for configs containing
+                            sensitive values (registry credentials, etc.).
+                          properties:
+                            name:
+                              description: name is the name of the Secret.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                    nodeSelector:
+                      description: |-
+                        nodeSelector selects which node(s) this override applies to.
+                        Typically matches a single node by hostname.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
+                  required:
+                  - machineConfig
+                  - nodeSelector
+                  type: object
+                type: array
+              nodeSelector:
+                description: |-
+                  nodeSelector selects which K8s nodes this FleetNodeSet manages.
+                  Only nodes matching ALL labels are included.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              paused:
+                description: |-
+                  paused stops all update operations. Nodes in progress will complete,
+                  but no new updates will start. Use as an emergency brake.
+                type: boolean
+              talos:
+                description: talos defines the desired Talos OS version and schematic.
+                properties:
+                  factoryURL:
+                    default: https://factory.talos.dev
+                    description: factoryURL is the Talos Factory base URL for pulling
+                      installer images.
+                    type: string
+                  schematic:
+                    description: |-
+                      schematic is the Talos Factory schematic ID for the installer image.
+                      Includes system extensions (e.g., iscsi-tools, qemu-guest-agent).
+                    type: string
+                  version:
+                    description: |-
+                      version is the desired Talos Linux version (e.g., "v1.12.5").
+                      When this differs from the node's actual version, TFC triggers
+                      a rolling upgrade via talosctl upgrade.
+                    type: string
+                required:
+                - schematic
+                - version
+                type: object
+              updateStrategy:
+                description: updateStrategy controls how updates are rolled out.
+                properties:
+                  configApplyMode:
+                    default: auto
+                    description: |-
+                      configApplyMode controls how machine config changes are applied.
+                      - auto: live apply if possible, reboot if required (default)
+                      - no-reboot: fail if reboot would be required
+                      - reboot: always reboot after applying
+                      - staged: save config, apply on next reboot
+                    enum:
+                    - auto
+                    - no-reboot
+                    - reboot
+                    - staged
+                    type: string
+                  drainTimeout:
+                    default: 300s
+                    description: |-
+                      drainTimeout is the maximum duration to wait for workload drain
+                      before proceeding. Respects PodDisruptionBudgets.
+                    type: string
+                  healthCheckTimeout:
+                    default: 120s
+                    description: |-
+                      healthCheckTimeout is the maximum duration to wait for a node
+                      to become Ready after an update before marking it as failed.
+                    type: string
+                  maxUnavailable:
+                    default: 1
+                    description: |-
+                      maxUnavailable is the maximum number of nodes that can be
+                      unavailable during an update. For control plane nodes, TFC
+                      always verifies etcd quorum regardless of this setting.
+                    minimum: 1
+                    type: integer
+                type: object
+            required:
+            - nodeSelector
+            - talos
+            type: object
+          status:
+            description: status defines the observed state.
+            properties:
+              conditions:
+                description: conditions represent the current state of the FleetNodeSet.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              failed:
+                description: failed is the number of nodes that failed to update.
+                type: integer
+              nodes:
+                description: nodes contains per-node status details.
+                items:
+                  description: FleetNodeStatus represents the observed state of a
+                    single managed node.
+                  properties:
+                    currentConfigHash:
+                      description: currentConfigHash is a SHA-256 hash of the node's
+                        actual machine config.
+                      type: string
+                    currentVersion:
+                      description: currentVersion is the actual Talos version running
+                        on this node.
+                      type: string
+                    desiredConfigHash:
+                      description: desiredConfigHash is a SHA-256 hash of the desired
+                        machine config.
+                      type: string
+                    desiredVersion:
+                      description: desiredVersion is the Talos version this node should
+                        be running.
+                      type: string
+                    lastApplied:
+                      description: lastApplied is the timestamp of the last successful
+                        config apply or upgrade.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message provides human-readable detail about the
+                        current phase.
+                      type: string
+                    name:
+                      description: name is the K8s Node name.
+                      type: string
+                    phase:
+                      description: phase is the current update phase of this node.
+                      enum:
+                      - Synced
+                      - Pending
+                      - Cordoning
+                      - Draining
+                      - Applying
+                      - Upgrading
+                      - HealthChecking
+                      - Failed
+                      type: string
+                  required:
+                  - name
+                  - phase
+                  type: object
+                type: array
+              observedGeneration:
+                description: observedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              pending:
+                description: pending is the number of nodes waiting to be updated.
+                type: integer
+              phase:
+                description: phase is the aggregate state of all managed nodes.
+                enum:
+                - Synced
+                - Progressing
+                - Degraded
+                - Paused
+                type: string
+              progressing:
+                description: progressing is the number of nodes currently being updated.
+                type: integer
+              synced:
+                description: synced is the number of nodes at desired version + config.
+                type: integer
+              total:
+                description: total is the number of nodes matching the nodeSelector.
+                type: integer
+            required:
+            - failed
+            - pending
+            - progressing
+            - synced
+            - total
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

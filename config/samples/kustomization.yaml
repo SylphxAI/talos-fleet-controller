@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- fleet_v1alpha1_fleetnodeset.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,77 @@
+apiVersion: fleet.talos.dev/v1alpha1
+kind: FleetNodeSet
+metadata:
+  name: control-plane
+  namespace: tfc-system
+spec:
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/control-plane: ""
+
+  talos:
+    version: v1.12.5
+    schematic: 3da7f440f279f4814fa73bdf83c84710a8e93c40a4a3cbba4d969f14afb96298
+
+  machineConfig:
+    inline: |
+      machine:
+        kernel:
+          modules:
+            - name: dm_thin_pool
+        kubelet:
+          extraArgs:
+            max-pods: "250"
+            register-with-taints: node.cilium.io/agent-not-ready=true:NoSchedule
+          extraMounts:
+            - destination: /var/mnt/topolvm
+              type: bind
+              source: /var/mnt/topolvm
+              options: [bind, rshared, rw]
+        nodeLabels:
+          katacontainers.io/kata-runtime: "true"
+          topolvm.io/node: "true"
+        sysctls:
+          net.ipv6.conf.all.forwarding: "1"
+      cluster:
+        controlPlane:
+          endpoint: https://10.10.0.240:6443
+        network:
+          cni:
+            name: none
+        proxy:
+          disabled: true
+        allowSchedulingOnControlPlanes: true
+
+  nodeOverrides:
+    - nodeSelector:
+        matchLabels:
+          kubernetes.io/hostname: compute-fsn1-2927556
+      machineConfig:
+        inline: |
+          machine:
+            network:
+              hostname: compute-fsn1-2927556
+              interfaces:
+                - deviceSelector:
+                    hardwareAddr: "9c:6b:00:4e:89:f5"
+                    physical: true
+                  dhcp: true
+                  addresses:
+                    - "2a01:4f8:2191:33e0::1/64"
+                  routes:
+                    - gateway: "fe80::1"
+                      network: "::/0"
+                  vip:
+                    ip: 10.10.0.240
+                  vlans:
+                    - vlanId: 4000
+                      addresses:
+                        - "10.10.0.2/24"
+            kubelet:
+              extraArgs:
+                node-ip: "10.10.0.2,2a01:4f8:2191:33e0::1"
+                provider-id: "hetzner-robot://2927556"
+
+  updateStrategy:
+    maxUnavailable: 1
+    configApplyMode: auto

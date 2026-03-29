@@ -1,0 +1,29 @@
+# This rule is not used by the project talos-fleet-controller itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to fleet.talos.dev resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: talos-fleet-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: fleetnodeset-viewer-role
+rules:
+- apiGroups:
+  - fleet.talos.dev
+  resources:
+  - fleetnodesets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - fleet.talos.dev
+  resources:
+  - fleetnodesets/status
+  verbs:
+  - get
