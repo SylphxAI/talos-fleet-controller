@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"time"
 
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -390,7 +392,17 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 			return fmt.Errorf("encode patched config for %s: %w", nodeName, err)
 		}
 
+		// Smart apply mode: if the config change affects kubelet (extraArgs,
+		// extraMounts, etc.), use "reboot" mode instead of "auto". This avoids
+		// the kubelet restart bind mount conflict (Talos #13053) where rshared
+		// propagated mounts are not cleaned up between container restarts.
+		// A full reboot clears all mount namespaces safely.
 		mode := talos.ApplyMode(fns.Spec.UpdateStrategy.ConfigApplyMode)
+		if mode == talos.ApplyModeAuto && configAffectsKubelet(desiredPatch) {
+			log.Info("config affects kubelet — using reboot mode to avoid mount conflict (talos#13053)",
+				"node", nodeName)
+			mode = talos.ApplyModeReboot
+		}
 		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, mergedConfig, mode); err != nil {
 			updatesTotal.WithLabelValues(fns.Name, "config", "failure").Inc()
 			_ = r.uncordonNode(ctx, a.node)
@@ -695,6 +707,32 @@ func (r *FleetNodeSetReconciler) getNodeLastApplied(fns *fleetv1alpha1.FleetNode
 		}
 	}
 	return nil
+}
+
+// configAffectsKubelet checks if a config patch contains fields that would
+// trigger a kubelet restart. When kubelet restarts with rshared extraMounts
+// (common with CSI drivers like TopoLVM, Longhorn, Rook Ceph), propagated
+// bind mounts are not cleaned up, causing ENOSPC on re-mount.
+// See: https://github.com/siderolabs/talos/issues/13053
+//
+// When detected, TFC uses "reboot" mode instead of "auto" to safely clear
+// all mount namespaces via full reboot.
+func configAffectsKubelet(patchYAML []byte) bool {
+	patchStr := string(patchYAML)
+	kubeletFields := []string{
+		"kubelet:",
+		"extraArgs:",
+		"extraMounts:",
+		"extraConfig:",
+		"clusterDNS:",
+		"nodeIP:",
+	}
+	for _, field := range kubeletFields {
+		if strings.Contains(patchStr, field) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Node helpers ---
