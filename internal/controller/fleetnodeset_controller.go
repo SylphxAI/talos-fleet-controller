@@ -185,17 +185,17 @@ func (r *FleetNodeSetReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // nodeAssessment holds the diff between desired and actual state for one node.
 type nodeAssessment struct {
-	node          *corev1.Node
-	nodeIP        string
-	isCP          bool
-	versionDrift  bool // actual version != desired version
-	configDrift   bool // actual config hash != desired config hash
-	currentVer    string
-	desiredVer    string
-	currentHash   string
-	desiredHash   string
-	isUpdating    bool // node is currently being updated (cordoned, etc.)
-	err           error
+	node         *corev1.Node
+	nodeIP       string
+	isCP         bool
+	versionDrift bool // actual version != desired version
+	configDrift  bool // actual config hash != desired config hash
+	currentVer   string
+	desiredVer   string
+	currentHash  string
+	desiredHash  string
+	isUpdating   bool // node is currently being updated (cordoned, etc.)
+	err          error
 }
 
 // selectNodes returns K8s Node objects matching the label selector.

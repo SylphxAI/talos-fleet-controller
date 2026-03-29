@@ -186,10 +186,11 @@ func main() {
 	setupCtx := context.Background()
 	talosClient, err := talos.NewClient(setupCtx)
 	if err != nil {
-		setupLog.Error(err, "Failed to create Talos client — ensure kubernetesTalosAPIAccess is enabled and ServiceAccount exists")
+		setupLog.Error(err, "Failed to create Talos client",
+			"hint", "ensure kubernetesTalosAPIAccess is enabled")
 		os.Exit(1)
 	}
-	defer talosClient.Close()
+	defer func() { _ = talosClient.Close() }()
 
 	if err := (&controller.FleetNodeSetReconciler{
 		Client:      mgr.GetClient(),
