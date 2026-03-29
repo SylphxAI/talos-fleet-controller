@@ -245,8 +245,12 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Compute desired config hash.
-	desiredConfig := r.buildDesiredConfig(fns, node)
+	// Compute desired config hash from the patch (not full config).
+	desiredConfig, err := r.buildDesiredPatch(fns, node)
+	if err != nil {
+		a.err = err
+		return a
+	}
 	a.desiredHash = hashConfig(desiredConfig)
 
 	// Get actual config hash.
@@ -262,8 +266,9 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	return a
 }
 
-// buildDesiredConfig merges base machineConfig + applicable nodeOverride for a node.
-func (r *FleetNodeSetReconciler) buildDesiredConfig(fns *fleetv1alpha1.FleetNodeSet, node *corev1.Node) []byte {
+// buildDesiredPatch merges base machineConfig + applicable nodeOverride for a node.
+// Returns a YAML patch (not a full config) — must be merged with current config before applying.
+func (r *FleetNodeSetReconciler) buildDesiredPatch(fns *fleetv1alpha1.FleetNodeSet, node *corev1.Node) ([]byte, error) {
 	// Start with base config.
 	var base string
 	if fns.Spec.MachineConfig != nil {
@@ -271,18 +276,18 @@ func (r *FleetNodeSetReconciler) buildDesiredConfig(fns *fleetv1alpha1.FleetNode
 		// TODO: support secretRef
 	}
 
-	// Find matching nodeOverride.
+	// Find matching nodeOverride and deep merge on top of base.
 	for _, override := range fns.Spec.NodeOverrides {
 		if matchesNode(override.NodeSelector, node) {
-			// Strategic merge: override on top of base.
-			// For v0.1.0, simple concatenation with YAML doc separator.
-			// TODO: proper strategic merge using Talos config merge logic.
-			base = base + "\n---\n" + override.MachineConfig.Inline
-			break
+			merged, err := mergeYAML(base, override.MachineConfig.Inline)
+			if err != nil {
+				return nil, fmt.Errorf("merge nodeOverride for %s: %w", node.Name, err)
+			}
+			return merged, nil
 		}
 	}
 
-	return []byte(base)
+	return []byte(base), nil
 }
 
 // executeNodeUpdate performs the full update sequence for a single node.
@@ -319,10 +324,31 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 	// Step 3: Apply config if drifted.
 	if a.configDrift {
 		r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseApplying, "Applying machine config")
-		desiredConfig := r.buildDesiredConfig(fns, a.node)
+
+		// Build desired patch from FleetNodeSet spec.
+		desiredPatch, err := r.buildDesiredPatch(fns, a.node)
+		if err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			return fmt.Errorf("build config patch for %s: %w", nodeName, err)
+		}
+
+		// Read current FULL config from node (includes cluster secrets).
+		currentConfig, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
+		if err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			return fmt.Errorf("read current config from %s: %w", nodeName, err)
+		}
+
+		// Deep merge patch on top of current config — secrets preserved.
+		mergedConfig, err := r.mergeConfigWithCurrent(currentConfig, desiredPatch)
+		if err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			return fmt.Errorf("merge config for %s: %w", nodeName, err)
+		}
+
 		mode := talos.ApplyMode(fns.Spec.UpdateStrategy.ConfigApplyMode)
-		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, desiredConfig, mode); err != nil {
-			_ = r.uncordonNode(ctx, a.node) // best-effort uncordon on failure
+		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, mergedConfig, mode); err != nil {
+			_ = r.uncordonNode(ctx, a.node)
 			return fmt.Errorf("apply config to %s: %w", nodeName, err)
 		}
 		log.Info("config applied", "node", nodeName)
