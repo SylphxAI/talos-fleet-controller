@@ -10,7 +10,7 @@ import (
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
-	"gopkg.in/yaml.v3"
+	configres "github.com/siderolabs/talos/pkg/machinery/resources/config"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 )
@@ -70,37 +70,21 @@ func (c *Client) NodeConfigRaw(ctx context.Context, nodeIP string) ([]byte, erro
 		return nil, fmt.Errorf("get machineconfig from %s: %w", nodeIP, err)
 	}
 
-	// resource.MarshalYAML + yaml.Marshal double-encodes the spec field,
-	// corrupting multi-document YAML. Instead, use the Spec() interface
-	// to access the raw config bytes directly.
-	//
-	// The COSI resource wraps the config; we need the unwrapped content.
-	// Access the Spec field via type assertion on the resource interface.
-	type specProvider interface {
-		Spec() any
-	}
-
-	sp, ok := r.(specProvider)
+	// Type-assert to MachineConfig to access Container().Bytes() — the only
+	// reliable way to get the raw config YAML without double-encoding.
+	mc, ok := r.(*configres.MachineConfig)
 	if !ok {
-		return nil, fmt.Errorf("machineconfig resource from %s does not implement Spec()", nodeIP)
+		return nil, fmt.Errorf("unexpected resource type from %s: %T (expected *MachineConfig)", nodeIP, r)
 	}
 
-	specVal := sp.Spec()
-
-	// The spec may be a string (raw YAML) or a typed config object.
-	switch v := specVal.(type) {
-	case string:
-		return []byte(v), nil
-	case []byte:
-		return v, nil
-	default:
-		// Fallback: marshal whatever the spec is to YAML.
-		specBytes, err := yaml.Marshal(v)
-		if err != nil {
-			return nil, fmt.Errorf("marshal config spec from %s: %w", nodeIP, err)
-		}
-		return specBytes, nil
+	// Container().Bytes() returns the original YAML source bytes that Talos
+	// stores internally — exactly what ApplyConfiguration expects.
+	configBytes, err := mc.Container().Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("get config bytes from %s: %w", nodeIP, err)
 	}
+
+	return configBytes, nil
 }
 
 // NodeConfigHash returns a SHA-256 hash of the node's current machine config.
