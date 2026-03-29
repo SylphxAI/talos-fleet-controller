@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -37,6 +38,7 @@ import (
 
 	fleetv1alpha1 "github.com/SylphxAI/talos-fleet-controller/api/v1alpha1"
 	"github.com/SylphxAI/talos-fleet-controller/internal/controller"
+	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -178,9 +180,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize Talos gRPC client.
+	// In-cluster: reads from ServiceAccount-injected secret (TALOSCONFIG env var).
+	// Local dev: reads from ~/.talos/config.
+	setupCtx := context.Background()
+	talosClient, err := talos.NewClient(setupCtx)
+	if err != nil {
+		setupLog.Error(err, "Failed to create Talos client — ensure kubernetesTalosAPIAccess is enabled and ServiceAccount exists")
+		os.Exit(1)
+	}
+	defer talosClient.Close()
+
 	if err := (&controller.FleetNodeSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		TalosClient: talosClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "FleetNodeSet")
 		os.Exit(1)

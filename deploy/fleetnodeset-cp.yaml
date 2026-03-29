@@ -1,0 +1,143 @@
+# FleetNodeSet for our production control plane nodes.
+# TFC will ensure all 3 CPs converge to this desired state.
+apiVersion: fleet.talos.dev/v1alpha1
+kind: FleetNodeSet
+metadata:
+  name: control-plane
+  namespace: tfc-system
+spec:
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/control-plane: ""
+
+  talos:
+    version: v1.12.4
+    schematic: 3da7f440f279f4814fa73bdf83c84710a8e93c40a4a3cbba4d969f14afb96298
+    factoryURL: https://factory.talos.dev
+
+  machineConfig:
+    inline: |
+      machine:
+        kernel:
+          modules:
+            - name: dm_thin_pool
+        kubelet:
+          extraArgs:
+            max-pods: "250"
+            register-with-taints: node.cilium.io/agent-not-ready=true:NoSchedule
+          extraMounts:
+            - destination: /var/mnt/topolvm
+              type: bind
+              source: /var/mnt/topolvm
+              options: [bind, rshared, rw]
+        nodeLabels:
+          katacontainers.io/kata-runtime: "true"
+          topolvm.io/node: "true"
+          node.kubernetes.io/exclude-from-external-load-balancers: ""
+        sysctls:
+          net.ipv6.conf.all.forwarding: "1"
+        features:
+          kubernetesTalosAPIAccess:
+            enabled: true
+            allowedRoles: [os:admin]
+            allowedKubernetesNamespaces: [tfc-system]
+      cluster:
+        controlPlane:
+          endpoint: https://10.10.0.240:6443
+        network:
+          cni:
+            name: none
+        proxy:
+          disabled: true
+        allowSchedulingOnControlPlanes: true
+
+  nodeOverrides:
+    # node1 (serverID 2920324)
+    - nodeSelector:
+        matchLabels:
+          kubernetes.io/hostname: talos-2a014f82713b491
+      machineConfig:
+        inline: |
+          machine:
+            network:
+              hostname: compute-fsn1-2920324
+              interfaces:
+                - deviceSelector:
+                    hardwareAddr: "a0:ad:9f:27:f7:e9"
+                    physical: true
+                  dhcp: true
+                  addresses: ["2a01:4f8:271:3b49::1/64"]
+                  routes:
+                    - gateway: "fe80::1"
+                      network: "::/0"
+                  vip:
+                    ip: 10.10.0.240
+                  vlans:
+                    - vlanId: 4000
+                      addresses: ["10.10.0.1/24"]
+            kubelet:
+              extraArgs:
+                node-ip: "10.10.0.1,2a01:4f8:271:3b49::1"
+                provider-id: "hetzner-robot://2920324"
+
+    # node2 (serverID 2927556)
+    - nodeSelector:
+        matchLabels:
+          kubernetes.io/hostname: compute-fsn1-2927556
+      machineConfig:
+        inline: |
+          machine:
+            network:
+              hostname: compute-fsn1-2927556
+              interfaces:
+                - deviceSelector:
+                    hardwareAddr: "9c:6b:00:4e:89:f5"
+                    physical: true
+                  dhcp: true
+                  addresses: ["2a01:4f8:2191:33e0::1/64"]
+                  routes:
+                    - gateway: "fe80::1"
+                      network: "::/0"
+                  vip:
+                    ip: 10.10.0.240
+                  vlans:
+                    - vlanId: 4000
+                      addresses: ["10.10.0.2/24"]
+            kubelet:
+              extraArgs:
+                node-ip: "10.10.0.2,2a01:4f8:2191:33e0::1"
+                provider-id: "hetzner-robot://2927556"
+
+    # node4 (serverID 2932787)
+    - nodeSelector:
+        matchLabels:
+          kubernetes.io/hostname: talos-10-10-0-4
+      machineConfig:
+        inline: |
+          machine:
+            network:
+              hostname: compute-fsn1-2932787
+              interfaces:
+                - deviceSelector:
+                    hardwareAddr: "a0:ad:9f:27:f7:e5"
+                    physical: true
+                  dhcp: true
+                  addresses: ["2a01:4f8:2210:2726::1/64"]
+                  routes:
+                    - gateway: "fe80::1"
+                      network: "::/0"
+                  vip:
+                    ip: 10.10.0.240
+                  vlans:
+                    - vlanId: 4000
+                      addresses: ["10.10.0.4/24"]
+            kubelet:
+              extraArgs:
+                node-ip: "10.10.0.4,2a01:4f8:2210:2726::1"
+                provider-id: "hetzner-robot://2932787"
+
+  updateStrategy:
+    maxUnavailable: 1
+    configApplyMode: auto
+    drainTimeout: 300s
+    healthCheckTimeout: 120s
