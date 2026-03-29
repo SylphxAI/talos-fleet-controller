@@ -245,23 +245,31 @@ func (r *FleetNodeSetReconciler) assessNode(ctx context.Context, node *corev1.No
 	a.currentVer = ver
 	a.versionDrift = (ver != fns.Spec.Talos.Version)
 
-	// Compute desired config hash from the patch (not full config).
-	desiredConfig, err := r.buildDesiredPatch(fns, node)
+	// Drift detection: merge desired patch onto current config,
+	// then compare the merged result against current. If same → no drift.
+	// This avoids false positives from comparing a patch hash vs full config hash.
+	currentRaw, err := r.TalosClient.NodeConfigRaw(ctx, a.nodeIP)
 	if err != nil {
+		log.Error(err, "failed to get config", "node", node.Name)
 		a.err = err
 		return a
 	}
-	a.desiredHash = hashConfig(desiredConfig)
+	a.currentHash = hashConfig(currentRaw)
 
-	// Get actual config hash.
-	actualHash, err := r.TalosClient.NodeConfigHash(ctx, a.nodeIP)
+	desiredPatch, err := r.buildDesiredPatch(fns, node)
 	if err != nil {
-		log.Error(err, "failed to get config hash", "node", node.Name)
 		a.err = err
 		return a
 	}
-	a.currentHash = actualHash
-	a.configDrift = (actualHash != a.desiredHash)
+
+	// Merge patch on top of current → what the config WOULD be after apply.
+	wouldBe, err := r.mergeConfigWithCurrent(currentRaw, desiredPatch)
+	if err != nil {
+		a.err = fmt.Errorf("compute drift for %s: %w", node.Name, err)
+		return a
+	}
+	a.desiredHash = hashConfig(wouldBe)
+	a.configDrift = (a.currentHash != a.desiredHash)
 
 	return a
 }
