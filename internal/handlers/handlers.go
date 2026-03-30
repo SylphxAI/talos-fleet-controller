@@ -26,6 +26,7 @@ import (
 
 	"gomodules.xyz/jsonpatch/v2"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
 )
@@ -34,6 +35,10 @@ import (
 type ExtensionHandlers struct {
 	// TalosClient is the Talos gRPC client used by UpdateMachine to apply configs.
 	TalosClient talos.Interface
+
+	// K8sReader is used to look up node IPs when Machine.Status.Addresses
+	// is empty in the UpdateMachineRequest (CAPI doesn't include runtime status in Desired).
+	K8sReader client.Reader
 
 	// state tracks in-flight UpdateMachine operations keyed by Machine namespace/name.
 	state sync.Map
@@ -46,9 +51,10 @@ type ExtensionHandlers struct {
 }
 
 // NewExtensionHandlers creates a new ExtensionHandlers instance.
-func NewExtensionHandlers(talosClient talos.Interface) *ExtensionHandlers {
+func NewExtensionHandlers(talosClient talos.Interface, k8sReader client.Reader) *ExtensionHandlers {
 	return &ExtensionHandlers{
 		TalosClient: talosClient,
+		K8sReader:   k8sReader,
 	}
 }
 

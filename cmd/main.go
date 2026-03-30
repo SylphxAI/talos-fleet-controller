@@ -28,6 +28,7 @@ import (
 	logsv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
@@ -118,8 +119,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create K8s client for node IP lookups.
+	restConfig := ctrl.GetConfigOrDie()
+	k8sClient, err := client.New(restConfig, client.Options{})
+	if err != nil {
+		setupLog.Error(err, "Failed to create K8s client")
+		os.Exit(1)
+	}
+
 	// Create extension handlers.
-	extHandlers := handlers.NewExtensionHandlers(talosClient)
+	extHandlers := handlers.NewExtensionHandlers(talosClient, k8sClient)
 
 	// Register in-place update hook handlers.
 	if err := webhookServer.AddExtensionHandler(server.ExtensionHandler{

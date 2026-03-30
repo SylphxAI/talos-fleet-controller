@@ -22,8 +22,10 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
@@ -103,6 +105,26 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 				if statusRaw, ok := infraObj["status"]; ok {
 					_ = json.Unmarshal(statusRaw, &infraStatus)
 					nodeIP = findIP(infraStatus.Addresses)
+				}
+			}
+		}
+	}
+	// Last resort: look up the K8s Node directly via K8sReader.
+	if nodeIP == "" && h.K8sReader != nil && machine.Status.NodeRef.Name != "" {
+		var node corev1.Node
+		if err := h.K8sReader.Get(ctx, client.ObjectKey{Name: machine.Status.NodeRef.Name}, &node); err == nil {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == corev1.NodeInternalIP {
+					nodeIP = addr.Address
+					break
+				}
+			}
+			if nodeIP == "" {
+				for _, addr := range node.Status.Addresses {
+					if addr.Type == corev1.NodeExternalIP {
+						nodeIP = addr.Address
+						break
+					}
 				}
 			}
 		}
