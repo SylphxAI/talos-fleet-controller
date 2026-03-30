@@ -839,7 +839,49 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 		time.Sleep(5 * time.Second)
 	}
 
-	return fmt.Errorf("drain timeout: pods still running on %s after %s", node.Name, timeout)
+	// Phase 3: Force-delete remaining pods that couldn't be evicted (PDB-blocked).
+	// This is equivalent to kubectl drain --force. Operators (CNPG, Strimzi) will
+	// recreate these pods on other nodes.
+	var finalRemaining []string
+	for i := range podsToEvict {
+		var pod corev1.Pod
+		err := r.Get(ctx, client.ObjectKey{
+			Name:      podsToEvict[i].Name,
+			Namespace: podsToEvict[i].Namespace,
+		}, &pod)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue // already terminating
+		}
+		if pod.Spec.NodeName != node.Name {
+			continue // rescheduled elsewhere
+		}
+
+		// Force delete
+		log.Info("force-deleting PDB-blocked pod", "pod", pod.Name, "namespace", pod.Namespace)
+		grace := int64(0)
+		if err := r.Delete(ctx, &pod, &client.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				log.Error(err, "force-delete failed", "pod", pod.Name)
+				finalRemaining = append(finalRemaining, pod.Name)
+			}
+		}
+	}
+
+	if len(finalRemaining) > 0 {
+		return fmt.Errorf("drain timeout: %d pods could not be force-deleted on %s: %v", len(finalRemaining), node.Name, finalRemaining)
+	}
+
+	log.Info("drain complete (with force-delete)", "node", node.Name, "evicted", evicted)
+	return nil
 }
 
 // isDaemonSetPod returns true if the pod is owned by a DaemonSet.
