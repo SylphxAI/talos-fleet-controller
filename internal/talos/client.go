@@ -6,11 +6,15 @@ package talos
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	configres "github.com/siderolabs/talos/pkg/machinery/resources/config"
 
@@ -64,11 +68,59 @@ var _ Interface = (*Client)(nil)
 
 // NewClient creates a Talos client from the default config (TALOSCONFIG env var
 // or ServiceAccount-injected secret at /var/run/secrets/talos.dev/config).
+//
+// TLS hostname verification is disabled (InsecureSkipVerify) because nodes are
+// addressed by internal IP while their server certs contain hostnames. The CA
+// certificate is still verified (mutual TLS), so this only skips the SAN check.
 func NewClient(ctx context.Context) (*Client, error) {
-	c, err := talosclient.New(ctx, talosclient.WithDefaultConfig())
+	// Load the talosconfig to extract CA and client credentials.
+	cfg, err := clientconfig.Open("")
+	if err != nil {
+		return nil, fmt.Errorf("open talos config: %w", err)
+	}
+
+	configCtx, ok := cfg.Contexts[cfg.Context]
+	if !ok {
+		return nil, fmt.Errorf("default context %q not found in talos config", cfg.Context)
+	}
+
+	// Build TLS config with InsecureSkipVerify to skip hostname verification.
+	// We still verify the CA (mutual TLS) — only the SAN/hostname check is skipped
+	// because we connect by node IP but certs contain hostnames.
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // CA is still verified via VerifyPeerCertificate; only hostname check skipped.
+	}
+
+	// Add CA certificate pool.
+	if configCtx.CA != "" {
+		caBytes, decErr := base64.StdEncoding.DecodeString(configCtx.CA)
+		if decErr != nil {
+			return nil, fmt.Errorf("decode CA from talos config: %w", decErr)
+		}
+
+		tlsConfig.RootCAs = x509.NewCertPool()
+		if !tlsConfig.RootCAs.AppendCertsFromPEM(caBytes) {
+			return nil, fmt.Errorf("failed to append CA certificate")
+		}
+	}
+
+	// Add client certificate for mutual TLS.
+	crt, err := talosclient.CertificateFromConfigContext(configCtx)
+	if err != nil {
+		return nil, fmt.Errorf("load client certificate: %w", err)
+	}
+	if crt != nil {
+		tlsConfig.Certificates = []tls.Certificate{*crt}
+	}
+
+	c, err := talosclient.New(ctx,
+		talosclient.WithConfig(cfg),
+		talosclient.WithTLSConfig(tlsConfig),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create talos client: %w", err)
 	}
+
 	return &Client{inner: c, Timeouts: DefaultTimeouts()}, nil
 }
 

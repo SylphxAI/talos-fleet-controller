@@ -774,6 +774,8 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 	}
 
 	// Phase 2: Wait for evicted pods to actually terminate.
+	// Pods that were evicted and rescheduled to other nodes (PDB-protected pods
+	// recreated by their controller) are no longer blocking drain of this node.
 	for time.Now().Before(deadline) {
 		remaining := 0
 		for i := range podsToEvict {
@@ -790,6 +792,17 @@ func (r *FleetNodeSetReconciler) drainNode(ctx context.Context, node *corev1.Nod
 			}
 			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 				continue // terminated
+			}
+			// Skip pods that have been rescheduled to a different node.
+			// This happens when PDB-protected pods are evicted and their
+			// controller recreates them on another node.
+			if pod.Spec.NodeName != node.Name {
+				continue
+			}
+			// Skip pods that are in Terminating state (deletion timestamp set).
+			// These pods are already shutting down and will be cleaned up.
+			if pod.DeletionTimestamp != nil {
+				continue
 			}
 			remaining++
 		}
