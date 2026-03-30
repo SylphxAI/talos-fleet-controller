@@ -109,21 +109,32 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 			}
 		}
 	}
-	// Last resort: look up the K8s Node directly via K8sReader.
-	if nodeIP == "" && h.K8sReader != nil && machine.Status.NodeRef.Name != "" {
-		var node corev1.Node
-		if err := h.K8sReader.Get(ctx, client.ObjectKey{Name: machine.Status.NodeRef.Name}, &node); err == nil {
-			for _, addr := range node.Status.Addresses {
-				if addr.Type == corev1.NodeInternalIP {
-					nodeIP = addr.Address
-					break
-				}
-			}
-			if nodeIP == "" {
-				for _, addr := range node.Status.Addresses {
-					if addr.Type == corev1.NodeExternalIP {
-						nodeIP = addr.Address
-						break
+	// Last resort: look up the actual Machine from K8s (Desired state may lack runtime status).
+	// Last resort: query actual Machine + Node from K8s API.
+	// UpdateMachineRequest.Desired may not include runtime status (addresses, nodeRef).
+	if nodeIP == "" && h.K8sReader != nil {
+		var actualMachine clusterv1.Machine
+		if err := h.K8sReader.Get(ctx, client.ObjectKey{
+			Namespace: machine.Namespace,
+			Name:      machine.Name,
+		}, &actualMachine); err == nil {
+			nodeIP = findIP(actualMachine.Status.Addresses)
+			if nodeIP == "" && actualMachine.Status.NodeRef.Name != "" {
+				var node corev1.Node
+				if err := h.K8sReader.Get(ctx, client.ObjectKey{Name: actualMachine.Status.NodeRef.Name}, &node); err == nil {
+					for _, addr := range node.Status.Addresses {
+						if addr.Type == corev1.NodeInternalIP {
+							nodeIP = addr.Address
+							break
+						}
+					}
+					if nodeIP == "" {
+						for _, addr := range node.Status.Addresses {
+							if addr.Type == corev1.NodeExternalIP {
+								nodeIP = addr.Address
+								break
+							}
+						}
 					}
 				}
 			}
