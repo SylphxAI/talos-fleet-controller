@@ -57,6 +57,11 @@ const (
 	// upgradeHealthCheckTimeout is the default health check timeout for upgrade operations.
 	// Upgrades involve a full reboot cycle and take longer than config applies. (H4)
 	upgradeHealthCheckTimeout = 600 * time.Second
+
+	// taintPendingConfig is the taint key set by CAPHR on newly provisioned nodes.
+	// TFC removes this taint after successfully converging the node's config.
+	// This prevents pods from being scheduled on unconfigured nodes.
+	taintPendingConfig = "fleet.talos.dev/pending-config"
 )
 
 // FleetNodeSetReconciler reconciles a FleetNodeSet object.
@@ -499,6 +504,14 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		return fmt.Errorf("health check %s: %w", nodeName, err)
 	}
 
+	// Step 5b: Remove pending-config taint if present.
+	// This taint was set by CAPHR on initial provisioning to prevent pods
+	// from being scheduled before TFC converges the node's config.
+	if err := r.removePendingConfigTaint(ctx, a.node); err != nil {
+		log.Error(err, "failed to remove pending-config taint", "node", nodeName)
+		// Non-fatal — continue with uncordon.
+	}
+
 	// Step 6: Uncordon.
 	if err := r.uncordonNode(ctx, a.node); err != nil {
 		_ = r.removeUpdateAnnotation(ctx, a.node)
@@ -594,6 +607,11 @@ func (r *FleetNodeSetReconciler) recoverOrphanedCordons(ctx context.Context, fns
 			continue
 		}
 
+		// Safety net: also remove pending-config taint during orphan recovery.
+		if err := r.removePendingConfigTaint(ctx, node); err != nil {
+			log.Error(err, "failed to remove pending-config taint from orphaned node", "node", node.Name)
+		}
+
 		if err := r.removeUpdateAnnotation(ctx, node); err != nil {
 			log.Error(err, "failed to remove update annotation from orphaned node", "node", node.Name)
 			continue
@@ -633,6 +651,39 @@ func (r *FleetNodeSetReconciler) removeUpdateAnnotation(ctx context.Context, nod
 	}
 	patch := client.MergeFrom(fresh.DeepCopy())
 	delete(fresh.Annotations, annotationUpdateStarted)
+	return r.Patch(ctx, &fresh, patch)
+}
+
+// removePendingConfigTaint removes the fleet.talos.dev/pending-config taint
+// from a node if present. This taint is set by CAPHR on newly provisioned nodes
+// to prevent scheduling before TFC converges the node's config. No-op if the
+// taint is not present.
+func (r *FleetNodeSetReconciler) removePendingConfigTaint(ctx context.Context, node *corev1.Node) error {
+	log := logf.FromContext(ctx)
+
+	var fresh corev1.Node
+	if err := r.Get(ctx, client.ObjectKeyFromObject(node), &fresh); err != nil {
+		return err
+	}
+
+	// Find and remove the pending-config taint.
+	found := false
+	taints := make([]corev1.Taint, 0, len(fresh.Spec.Taints))
+	for _, t := range fresh.Spec.Taints {
+		if t.Key == taintPendingConfig {
+			found = true
+			continue
+		}
+		taints = append(taints, t)
+	}
+
+	if !found {
+		return nil // taint not present — no-op
+	}
+
+	log.Info("removing pending-config taint", "node", fresh.Name)
+	patch := client.MergeFrom(fresh.DeepCopy())
+	fresh.Spec.Taints = taints
 	return r.Patch(ctx, &fresh, patch)
 }
 
