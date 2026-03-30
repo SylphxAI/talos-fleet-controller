@@ -19,9 +19,14 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
@@ -107,7 +112,7 @@ func (h *ExtensionHandlers) DoCanUpdateMachine(ctx context.Context, req *runtime
 	// patches and applies them on top of the node's live config. This preserves
 	// per-node identity (hostname, VLAN, MAC, IPv6) that CAPHR injected at Day 0.
 	machineKey := klog.KObj(&req.Desired.Machine).String()
-	if err := h.storeBootstrapConfigDiff(machineKey, req.Current.BootstrapConfig.Raw, req.Desired.BootstrapConfig.Raw); err != nil {
+	if err := h.storeBootstrapConfigDiff(ctx, machineKey, req.Current.BootstrapConfig.Raw, req.Desired.BootstrapConfig.Raw); err != nil {
 		// Log but don't fail the CanUpdateMachine response — we still claim
 		// we can handle the changes. UpdateMachine will fail if the stored
 		// patches are missing, which is the safe default (avoids overwriting
@@ -124,7 +129,10 @@ func (h *ExtensionHandlers) DoCanUpdateMachine(ctx context.Context, req *runtime
 
 // storeBootstrapConfigDiff computes the strategic merge patch between the current
 // and desired BootstrapConfig and stores it for later use by UpdateMachine.
-func (h *ExtensionHandlers) storeBootstrapConfigDiff(machineKey string, currentRaw, desiredRaw []byte) error {
+// Patches are stored in-memory (fast path) AND persisted to a ConfigMap
+// (durable — survives pod restarts). UpdateMachine checks in-memory first,
+// falls back to ConfigMap if needed.
+func (h *ExtensionHandlers) storeBootstrapConfigDiff(ctx context.Context, machineKey string, currentRaw, desiredRaw []byte) error {
 	currentYAML, err := extractBootstrapData(currentRaw)
 	if err != nil {
 		return err
@@ -150,9 +158,60 @@ func (h *ExtensionHandlers) storeBootstrapConfigDiff(machineKey string, currentR
 		return err
 	}
 
+	// Store in-memory (fast path).
 	h.configPatches.Store(machineKey, patches)
 
+	// Persist current BootstrapConfig raw bytes to ConfigMap so UpdateMachine
+	// can re-derive patches after a pod restart. The desired config is always
+	// available from the UpdateMachineRequest, so we only need to persist current.
+	if h.K8sClient != nil {
+		if err := h.persistCurrentConfig(ctx, machineKey, currentRaw); err != nil {
+			// Log but don't fail — in-memory path still works for the happy case.
+			ctrl.LoggerFrom(ctx).Error(err, "Failed to persist current config to ConfigMap (pod restart recovery degraded)")
+		}
+	}
+
 	return nil
+}
+
+// persistCurrentConfig writes the current BootstrapConfig raw bytes to a ConfigMap
+// so UpdateMachine can re-derive patches after a pod restart.
+func (h *ExtensionHandlers) persistCurrentConfig(ctx context.Context, machineKey string, currentRaw []byte) error {
+	dataKey := strings.ReplaceAll(machineKey, "/", ".")
+
+	// Try to get existing ConfigMap.
+	var cm corev1.ConfigMap
+	err := h.K8sClient.Get(ctx, client.ObjectKey{
+		Namespace: extensionNamespace,
+		Name:      configCacheConfigMapName,
+	}, &cm)
+
+	if apierrors.IsNotFound(err) {
+		// Create the ConfigMap.
+		cm = corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configCacheConfigMapName,
+				Namespace: extensionNamespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "talos-inplace-extension",
+				},
+			},
+			Data: map[string]string{
+				dataKey: string(currentRaw),
+			},
+		}
+		return h.K8sClient.Create(ctx, &cm)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Update existing ConfigMap with new entry.
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	cm.Data[dataKey] = string(currentRaw)
+	return h.K8sClient.Update(ctx, &cm)
 }
 
 // DoCanUpdateMachineSet implements the CanUpdateMachineSet hook.

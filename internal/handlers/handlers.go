@@ -31,14 +31,25 @@ import (
 	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
 )
 
+const (
+	// configCacheConfigMapName is the ConfigMap used to persist current
+	// BootstrapConfig raw bytes across pod restarts. UpdateMachine retrieves
+	// these to re-compute config patches when in-memory state is lost.
+	configCacheConfigMapName = "inplace-config-cache"
+
+	// extensionNamespace is the namespace where the extension runs.
+	// Used for owning the config cache ConfigMap.
+	extensionNamespace = "talos-inplace-system"
+)
+
 // ExtensionHandlers provides shared state for all in-place update hook handlers.
 type ExtensionHandlers struct {
 	// TalosClient is the Talos gRPC client used by UpdateMachine to apply configs.
 	TalosClient talos.Interface
 
-	// K8sReader is used to look up node IPs when Machine.Status.Addresses
-	// is empty in the UpdateMachineRequest (CAPI doesn't include runtime status in Desired).
-	K8sReader client.Reader
+	// K8sClient is used to look up node IPs (when Machine.Status.Addresses is empty)
+	// and to persist config cache in ConfigMaps (survives pod restarts).
+	K8sClient client.Client
 
 	// state tracks in-flight UpdateMachine operations keyed by Machine namespace/name.
 	state sync.Map
@@ -51,10 +62,10 @@ type ExtensionHandlers struct {
 }
 
 // NewExtensionHandlers creates a new ExtensionHandlers instance.
-func NewExtensionHandlers(talosClient talos.Interface, k8sReader client.Reader) *ExtensionHandlers {
+func NewExtensionHandlers(talosClient talos.Interface, k8sClient client.Client) *ExtensionHandlers {
 	return &ExtensionHandlers{
 		TalosClient: talosClient,
-		K8sReader:   k8sReader,
+		K8sClient:   k8sClient,
 	}
 }
 

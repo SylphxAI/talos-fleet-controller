@@ -20,16 +20,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	yaml "sigs.k8s.io/yaml"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 
+	"github.com/siderolabs/talos/pkg/machinery/config/configdiff"
+	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 
@@ -109,19 +113,33 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 			}
 		}
 	}
-	// Last resort: look up the actual Machine from K8s (Desired state may lack runtime status).
 	// Last resort: query actual Machine + Node from K8s API.
 	// UpdateMachineRequest.Desired may not include runtime status (addresses, nodeRef).
-	if nodeIP == "" && h.K8sReader != nil {
+	if nodeIP == "" && h.K8sClient != nil {
+		log.Info("IP lookup: querying actual Machine from K8s API",
+			"namespace", machine.Namespace, "name", machine.Name)
 		var actualMachine clusterv1.Machine
-		if err := h.K8sReader.Get(ctx, client.ObjectKey{
+		if err := h.K8sClient.Get(ctx, client.ObjectKey{
 			Namespace: machine.Namespace,
 			Name:      machine.Name,
-		}, &actualMachine); err == nil {
+		}, &actualMachine); err != nil {
+			log.Error(err, "IP lookup: failed to get Machine from K8s API",
+				"namespace", machine.Namespace, "name", machine.Name)
+		} else {
+			log.Info("IP lookup: got Machine from K8s API",
+				"addressCount", len(actualMachine.Status.Addresses),
+				"nodeRef", actualMachine.Status.NodeRef.Name)
 			nodeIP = findIP(actualMachine.Status.Addresses)
 			if nodeIP == "" && actualMachine.Status.NodeRef.Name != "" {
+				log.Info("IP lookup: Machine has no usable address, trying Node",
+					"nodeRef", actualMachine.Status.NodeRef.Name)
 				var node corev1.Node
-				if err := h.K8sReader.Get(ctx, client.ObjectKey{Name: actualMachine.Status.NodeRef.Name}, &node); err == nil {
+				if err := h.K8sClient.Get(ctx, client.ObjectKey{Name: actualMachine.Status.NodeRef.Name}, &node); err != nil {
+					log.Error(err, "IP lookup: failed to get Node from K8s API",
+						"nodeName", actualMachine.Status.NodeRef.Name)
+				} else {
+					log.Info("IP lookup: got Node from K8s API",
+						"addressCount", len(node.Status.Addresses))
 					for _, addr := range node.Status.Addresses {
 						if addr.Type == corev1.NodeInternalIP {
 							nodeIP = addr.Address
@@ -139,6 +157,8 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 				}
 			}
 		}
+	} else if nodeIP == "" {
+		log.Info("IP lookup: K8sReader is nil, cannot query K8s API")
 	}
 	if nodeIP == "" {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
@@ -200,42 +220,117 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 	// Use Load (not LoadAndDelete) because CAPI may retry UpdateMachine
 	// multiple times if ApplyConfig fails transiently. We clean up after
 	// successful apply.
-	patchesVal, hasPatch := h.configPatches.Load(key)
-	if !hasPatch {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = "no config patch found — CanUpdateMachine must run before UpdateMachine"
-		return
-	}
-	patches := patchesVal.([]configpatcher.Patch)
-
-	// Step 2: Read the node's live config.
+	//
+	// If patches are not in memory (pod restarted), re-derive them from the
+	// ConfigMap cache that CanUpdateMachine persisted. This makes UpdateMachine
+	// resilient to pod restarts.
+	// Step 1: Read the node's live config (needed for all code paths).
 	liveProvider, err := h.TalosClient.NodeConfigProvider(ctx, nodeIP)
 	if err != nil {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = "failed to read live config from node: " + err.Error()
 		return
 	}
+	liveBytes := mustEncodeProvider(liveProvider)
 
-	// Step 3: Apply the template diff patches on top of the live config.
-	patched, err := configpatcher.Apply(configpatcher.WithConfig(liveProvider), patches)
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = "failed to apply config patch: " + err.Error()
-		return
+	// Step 2: Compute the merged config to apply.
+	// Three paths, in order of preference:
+	//   A. In-memory patches from CanUpdateMachine (fast path)
+	//   B. Re-derived patches from ConfigMap cache (pod restart recovery)
+	//   C. Direct merge: desired template + per-node identity from live (self-sufficient)
+	//
+	// Path C is the fallback when CanUpdateMachine was never called
+	// (e.g., CACPPT RuntimeClient is nil — the common case for Talos).
+	var patchedBytes []byte
+
+	patchesVal, hasPatch := h.configPatches.Load(key)
+	if !hasPatch {
+		log.Info("No in-memory patches — trying ConfigMap recovery")
+		var recoverErr error
+		patchesVal, recoverErr = h.recoverPatchesFromConfigMap(ctx, key, req.Desired.BootstrapConfig.Raw)
+		if recoverErr != nil {
+			log.Info("ConfigMap recovery failed — using direct merge mode", "error", recoverErr.Error())
+		} else {
+			hasPatch = true
+			log.Info("Recovered patches from ConfigMap cache")
+		}
 	}
 
-	patchedBytes, err := patched.Bytes()
-	if err != nil {
-		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = "failed to encode patched config: " + err.Error()
-		return
-	}
+	if hasPatch {
+		// Path A/B: Apply cached/recovered patches on live config.
+		patches := patchesVal.([]configpatcher.Patch)
+		patched, err := configpatcher.Apply(configpatcher.WithConfig(liveProvider), patches)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = "failed to apply config patch: " + err.Error()
+			return
+		}
+		patchedBytes, err = patched.Bytes()
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = "failed to encode patched config: " + err.Error()
+			return
+		}
+		log.Info("Config merged via patch mode",
+			"patchCount", len(patches),
+			"liveConfigLen", len(liveBytes),
+			"patchedConfigLen", len(patchedBytes),
+		)
+	} else {
+		// Path C: Apply strategic patches from TalosConfig directly on the live config.
+		// This is the primary path when CACPPT RuntimeClient is nil (Talos default).
+		//
+		// The BootstrapConfig is a CABPT TalosConfig with spec.strategicPatches —
+		// these are template-level patches (NOT a full config). Applying them on
+		// the live config preserves per-node identity naturally because the patches
+		// only touch template-level fields.
+		strategicPatches, err := extractStrategicPatches(req.Desired.BootstrapConfig.Raw)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = "failed to extract strategic patches from BootstrapConfig: " + err.Error()
+			return
+		}
 
-	log.Info("Config patch applied",
-		"patchCount", len(patches),
-		"liveConfigLen", len(mustEncodeProvider(liveProvider)),
-		"patchedConfigLen", len(patchedBytes),
-	)
+		if len(strategicPatches) == 0 {
+			// No strategic patches — nothing to change.
+			log.Info("No strategic patches in desired BootstrapConfig — nothing to apply")
+			h.state.Store(key, &updateState{startedAt: time.Now(), applied: true})
+			resp.Status = runtimehooksv1.ResponseStatusSuccess
+			resp.Message = "No config changes to apply"
+			resp.RetryAfterSeconds = retryIntervalSeconds
+			return
+		}
+
+		// Load each strategic patch and apply on top of the live config.
+		var allPatches []configpatcher.Patch
+		for i, patchStr := range strategicPatches {
+			patch, err := configpatcher.LoadPatch([]byte(patchStr))
+			if err != nil {
+				resp.Status = runtimehooksv1.ResponseStatusFailure
+				resp.Message = fmt.Sprintf("failed to load strategic patch %d: %s", i, err.Error())
+				return
+			}
+			allPatches = append(allPatches, patch)
+		}
+
+		patched, err := configpatcher.Apply(configpatcher.WithConfig(liveProvider), allPatches)
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = "failed to apply strategic patches on live config: " + err.Error()
+			return
+		}
+		patchedBytes, err = patched.Bytes()
+		if err != nil {
+			resp.Status = runtimehooksv1.ResponseStatusFailure
+			resp.Message = "failed to encode patched config: " + err.Error()
+			return
+		}
+		log.Info("Config merged via strategic patch mode (CABPT patches on live config)",
+			"patchCount", len(allPatches),
+			"liveConfigLen", len(liveBytes),
+			"patchedConfigLen", len(patchedBytes),
+		)
+	}
 
 	// Determine apply mode based on node role.
 	mode := talos.ApplyModeAuto
@@ -262,6 +357,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 
 	// Config applied successfully. Clean up stored patches and record state.
 	h.configPatches.Delete(key)
+	h.cleanupConfigCache(ctx, key)
 	h.state.Store(key, &updateState{startedAt: time.Now(), applied: true})
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 	resp.Message = "Config applied via Talos API; waiting for node to settle"
@@ -329,6 +425,218 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 func mustEncodeProvider(p interface{ EncodeBytes(...encoder.Option) ([]byte, error) }) []byte {
 	b, _ := p.EncodeBytes(encoder.WithComments(encoder.CommentsDisabled))
 	return b
+}
+
+// extractStrategicPatches extracts the strategic merge patches from a CABPT
+// TalosConfig BootstrapConfig JSON. The TalosConfig has spec.strategicPatches
+// which is an array of YAML strings (Talos strategic merge patches).
+func extractStrategicPatches(raw []byte) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("unmarshal BootstrapConfig: %w", err)
+	}
+	spec, ok := obj["spec"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("no spec in BootstrapConfig")
+	}
+	patchesRaw, ok := spec["strategicPatches"]
+	if !ok {
+		return nil, nil // No strategic patches.
+	}
+	patchesArr, ok := patchesRaw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("strategicPatches is not an array")
+	}
+	var patches []string
+	for _, p := range patchesArr {
+		s, ok := p.(string)
+		if !ok {
+			continue
+		}
+		patches = append(patches, s)
+	}
+	return patches, nil
+}
+
+// mergeDesiredWithPerNodeIdentity takes the desired template config YAML and the
+// live config YAML from the node, and produces a merged config that has the new
+// template values PLUS per-node identity preserved from the live config.
+//
+// Per-node identity fields (injected by CAPHR at Day 0):
+//   - machine.network.hostname
+//   - machine.network.interfaces (MAC, VLAN, addresses — entire array)
+//   - machine.kubelet.extraArgs (node-ip, provider-id)
+//   - machine.kubelet.nodeIP (validSubnets for dual-stack)
+//
+// Strategy: Parse both configs as YAML maps. Start with the desired config,
+// then overlay per-node fields from the live config. This preserves template
+// changes while keeping per-node identity intact.
+func mergeDesiredWithPerNodeIdentity(desiredYAML, liveYAML []byte) ([]byte, error) {
+	var desired, live map[string]interface{}
+	if err := yaml.Unmarshal(desiredYAML, &desired); err != nil {
+		return nil, fmt.Errorf("parse desired config: %w", err)
+	}
+	if err := yaml.Unmarshal(liveYAML, &live); err != nil {
+		return nil, fmt.Errorf("parse live config: %w", err)
+	}
+
+	liveMachine := getMap(live, "machine")
+	desiredMachine := getMap(desired, "machine")
+	if liveMachine == nil || desiredMachine == nil {
+		// Can't merge — return desired as-is.
+		return desiredYAML, nil
+	}
+
+	liveNetwork := getMap(liveMachine, "network")
+	desiredNetwork := getMap(desiredMachine, "network")
+
+	// Preserve hostname from live config.
+	if liveNetwork != nil && desiredNetwork != nil {
+		if hostname, ok := liveNetwork["hostname"]; ok {
+			desiredNetwork["hostname"] = hostname
+		}
+	}
+
+	// Preserve entire interfaces array from live config.
+	// Interfaces contain per-node MAC addresses, VLAN IPs, device selectors —
+	// all injected by CAPHR at Day 0 and unique per node.
+	if liveNetwork != nil && desiredNetwork != nil {
+		if ifaces, ok := liveNetwork["interfaces"]; ok {
+			desiredNetwork["interfaces"] = ifaces
+		}
+	}
+
+	// Preserve kubelet per-node settings.
+	liveKubelet := getMap(liveMachine, "kubelet")
+	desiredKubelet := getMap(desiredMachine, "kubelet")
+	if desiredKubelet == nil && liveKubelet != nil {
+		desiredKubelet = map[string]interface{}{}
+		desiredMachine["kubelet"] = desiredKubelet
+	}
+	if liveKubelet != nil && desiredKubelet != nil {
+		// Merge extraArgs from live into desired (live takes precedence for per-node keys).
+		if liveArgs, ok := liveKubelet["extraArgs"].(map[string]interface{}); ok {
+			desiredArgs, _ := desiredKubelet["extraArgs"].(map[string]interface{})
+			if desiredArgs == nil {
+				desiredArgs = map[string]interface{}{}
+			}
+			for k, v := range liveArgs {
+				desiredArgs[k] = v
+			}
+			desiredKubelet["extraArgs"] = desiredArgs
+		}
+		// Preserve nodeIP (validSubnets for dual-stack).
+		if nodeIP, ok := liveKubelet["nodeIP"]; ok {
+			desiredKubelet["nodeIP"] = nodeIP
+		}
+	}
+
+	return yaml.Marshal(desired)
+}
+
+// getMap safely extracts a nested map from a parent map.
+func getMap(parent map[string]interface{}, key string) map[string]interface{} {
+	if parent == nil {
+		return nil
+	}
+	v, ok := parent[key]
+	if !ok {
+		return nil
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+// cleanupConfigCache removes the machine's entry from the config cache ConfigMap.
+func (h *ExtensionHandlers) cleanupConfigCache(ctx context.Context, machineKey string) {
+	if h.K8sClient == nil {
+		return
+	}
+	log := ctrl.LoggerFrom(ctx)
+	var cm corev1.ConfigMap
+	if err := h.K8sClient.Get(ctx, client.ObjectKey{
+		Namespace: extensionNamespace,
+		Name:      configCacheConfigMapName,
+	}, &cm); err != nil {
+		return // ConfigMap doesn't exist or error — nothing to clean up.
+	}
+	dataKey := sanitizeConfigMapKey(machineKey)
+	if _, ok := cm.Data[dataKey]; !ok {
+		return // Entry doesn't exist.
+	}
+	delete(cm.Data, dataKey)
+	if err := h.K8sClient.Update(ctx, &cm); err != nil {
+		log.Error(err, "Failed to clean up config cache ConfigMap entry", "machineKey", machineKey)
+	}
+}
+
+// recoverPatchesFromConfigMap re-derives config patches after a pod restart.
+// CanUpdateMachine persists the current BootstrapConfig raw bytes in a ConfigMap.
+// This method reads those bytes, combines them with the desired BootstrapConfig
+// from the UpdateMachineRequest, and re-computes the strategic merge patches.
+func (h *ExtensionHandlers) recoverPatchesFromConfigMap(ctx context.Context, machineKey string, desiredBootstrapRaw []byte) (interface{}, error) {
+	if h.K8sClient == nil {
+		return nil, fmt.Errorf("K8s client is nil")
+	}
+
+	// Read the ConfigMap with cached current BootstrapConfig bytes.
+	var cm corev1.ConfigMap
+	if err := h.K8sClient.Get(ctx, client.ObjectKey{
+		Namespace: extensionNamespace,
+		Name:      configCacheConfigMapName,
+	}, &cm); err != nil {
+		return nil, fmt.Errorf("failed to get config cache ConfigMap: %w", err)
+	}
+
+	// ConfigMap data key uses the machine key with slashes replaced by dots.
+	dataKey := sanitizeConfigMapKey(machineKey)
+	currentRawStr, ok := cm.Data[dataKey]
+	if !ok {
+		return nil, fmt.Errorf("no cached current config for machine %s in ConfigMap", machineKey)
+	}
+
+	currentRaw := []byte(currentRawStr)
+
+	// Re-derive patches using the same logic as CanUpdateMachine.
+	currentYAML, err := extractBootstrapData(currentRaw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract current bootstrap data: %w", err)
+	}
+	desiredYAML, err := extractBootstrapData(desiredBootstrapRaw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract desired bootstrap data: %w", err)
+	}
+
+	currentProvider, err := configloader.NewFromBytes(currentYAML)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse current config: %w", err)
+	}
+	desiredProvider, err := configloader.NewFromBytes(desiredYAML)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse desired config: %w", err)
+	}
+
+	patches, err := configdiff.Patch(currentProvider, desiredProvider)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute config diff: %w", err)
+	}
+
+	// Re-populate in-memory cache for subsequent retries.
+	h.configPatches.Store(machineKey, patches)
+
+	return patches, nil
+}
+
+// sanitizeConfigMapKey converts a Machine key (e.g. "caphr/machine-name")
+// into a valid ConfigMap data key by replacing slashes with dots.
+func sanitizeConfigMapKey(key string) string {
+	return strings.ReplaceAll(key, "/", ".")
 }
 
 // findIP extracts the best IP from a list of MachineAddresses.

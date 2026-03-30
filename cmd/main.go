@@ -23,6 +23,8 @@ import (
 	"os"
 
 	"github.com/spf13/pflag"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/logs"
 	logsv1 "k8s.io/component-base/logs/api/v1"
@@ -30,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
 	"sigs.k8s.io/cluster-api/exp/runtime/server"
@@ -120,12 +123,21 @@ func main() {
 	}
 
 	// Create K8s client for node IP lookups.
+	// Must register both core K8s types (Node) and CAPI types (Machine)
+	// in the scheme — without this, client.Get() for Machine objects fails
+	// with "no kind is registered" and the IP lookup silently falls through.
+	scheme := k8sruntime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme) // core/v1 (Node, Pod, etc.)
+	_ = clusterv1.AddToScheme(scheme)      // cluster.x-k8s.io/v1beta2 (Machine, etc.)
+
 	restConfig := ctrl.GetConfigOrDie()
-	k8sClient, err := client.New(restConfig, client.Options{})
+	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		setupLog.Error(err, "Failed to create K8s client")
 		os.Exit(1)
 	}
+
+	setupLog.Info("K8s client created with CAPI scheme for Machine/Node lookups")
 
 	// Create extension handlers.
 	extHandlers := handlers.NewExtensionHandlers(talosClient, k8sClient)
