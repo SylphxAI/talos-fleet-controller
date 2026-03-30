@@ -88,20 +88,22 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 	key := klog.KObj(&req.Desired.Machine).String()
 	machine := &req.Desired.Machine
 
-	// Find the node's IP from Machine status addresses.
+	// Find the node's IP. Try Machine addresses first, then InfrastructureMachine.
 	// Prefer InternalIP (VLAN), fallback to ExternalIP (public).
-	nodeIP := ""
-	for _, addr := range machine.Status.Addresses {
-		if addr.Type == clusterv1.MachineInternalIP {
-			nodeIP = addr.Address
-			break
-		}
-	}
+	nodeIP := findIP(machine.Status.Addresses)
 	if nodeIP == "" {
-		for _, addr := range machine.Status.Addresses {
-			if addr.Type == clusterv1.MachineExternalIP {
-				nodeIP = addr.Address
-				break
+		// Machine.Status.Addresses may be empty in UpdateMachineRequest.
+		// Try extracting from InfrastructureMachine status.
+		var infraStatus struct {
+			Addresses []clusterv1.MachineAddress `json:"addresses"`
+		}
+		if req.Desired.InfrastructureMachine.Raw != nil {
+			var infraObj map[string]json.RawMessage
+			if err := json.Unmarshal(req.Desired.InfrastructureMachine.Raw, &infraObj); err == nil {
+				if statusRaw, ok := infraObj["status"]; ok {
+					_ = json.Unmarshal(statusRaw, &infraStatus)
+					nodeIP = findIP(infraStatus.Addresses)
+				}
 			}
 		}
 	}
@@ -294,4 +296,20 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 func mustEncodeProvider(p interface{ EncodeBytes(...encoder.Option) ([]byte, error) }) []byte {
 	b, _ := p.EncodeBytes(encoder.WithComments(encoder.CommentsDisabled))
 	return b
+}
+
+// findIP extracts the best IP from a list of MachineAddresses.
+// Prefers InternalIP, falls back to ExternalIP.
+func findIP(addrs []clusterv1.MachineAddress) string {
+	for _, a := range addrs {
+		if a.Type == clusterv1.MachineInternalIP {
+			return a.Address
+		}
+	}
+	for _, a := range addrs {
+		if a.Type == clusterv1.MachineExternalIP {
+			return a.Address
+		}
+	}
+	return ""
 }
