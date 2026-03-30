@@ -19,9 +19,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"reflect"
 
-	"github.com/mattbaird/jsonpatch"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -207,42 +205,17 @@ func createBootstrapConfigPatch(currentRaw, desiredRaw []byte) ([]byte, error) {
 	}
 
 	// Copy all desired spec fields into current to claim them.
+	// For Talos, we can handle all spec changes in-place via talosctl apply-config.
 	if desiredSpec, ok := desiredObj["spec"]; ok {
 		currentObj["spec"] = desiredSpec
 	}
 
-	// If the objects are already equal, return empty patch.
-	if reflect.DeepEqual(currentObj, desiredObj) {
-		// Re-marshal current with claimed changes and diff against original.
-		modifiedBytes, err := json.Marshal(currentObj)
-		if err != nil {
-			return nil, err
-		}
-		patch, err := jsonpatch.CreatePatch(currentRaw, modifiedBytes)
-		if err != nil {
-			return nil, err
-		}
-		patchBytes, err := json.Marshal(patch)
-		if err != nil {
-			return nil, err
-		}
-		return patchBytes, nil
-	}
-
-	// Re-marshal current with claimed changes.
+	// Re-marshal current with claimed changes and diff against original.
 	modifiedBytes, err := json.Marshal(currentObj)
 	if err != nil {
 		return nil, err
 	}
-	patch, err := jsonpatch.CreatePatch(currentRaw, modifiedBytes)
-	if err != nil {
-		return nil, err
-	}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return nil, err
-	}
-	return patchBytes, nil
+	return createJSONPatchFromBytes(currentRaw, modifiedBytes)
 }
 
 // createInfraMachinePatch takes the raw current and desired InfrastructureMachine
@@ -270,13 +243,5 @@ func createInfraMachinePatch(currentRaw, desiredRaw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	patch, err := jsonpatch.CreatePatch(currentRaw, modifiedBytes)
-	if err != nil {
-		return nil, err
-	}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return nil, err
-	}
-	return patchBytes, nil
+	return createJSONPatchFromBytes(currentRaw, modifiedBytes)
 }

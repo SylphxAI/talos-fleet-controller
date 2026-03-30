@@ -54,16 +54,15 @@ func createJSONPatch(marshalledOriginal []byte, modified runtime.Object) ([]byte
 	if err != nil {
 		return nil, err
 	}
+	return createJSONPatchFromBytes(marshalledOriginal, marshalledModified)
+}
 
-	patch, err := jsonpatch.CreatePatch(marshalledOriginal, marshalledModified)
+// createJSONPatchFromBytes produces an RFC 6902 JSON patch from two raw JSON byte slices.
+// Used when working with untyped map[string]interface{} objects instead of runtime.Object.
+func createJSONPatchFromBytes(original, modified []byte) ([]byte, error) {
+	patch, err := jsonpatch.CreatePatch(original, modified)
 	if err != nil {
 		return nil, err
 	}
-
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return nil, err
-	}
-
-	return patchBytes, nil
+	return json.Marshal(patch)
 }

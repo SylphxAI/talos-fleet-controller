@@ -25,6 +25,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 
 	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
@@ -39,8 +40,11 @@ const (
 	// finish applying config before declaring failure.
 	updateTimeoutDuration = 5 * time.Minute
 
-	// controlPlaneLabel is the standard Kubernetes label for control plane nodes.
-	controlPlaneLabel = "node-role.kubernetes.io/control-plane"
+	// controlPlaneLabel is the CAPI Machine label for control plane nodes.
+	// Note: this is the CAPI label (cluster.x-k8s.io/control-plane), NOT the
+	// K8s node role label (node-role.kubernetes.io/control-plane).
+	// UpdateMachine receives CAPI Machine objects, not K8s Nodes.
+	controlPlaneLabel = "cluster.x-k8s.io/control-plane"
 )
 
 // updateState tracks in-progress UpdateMachine operations.
@@ -79,7 +83,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 	// Find the node's internal IP from Machine status addresses.
 	nodeIP := ""
 	for _, addr := range machine.Status.Addresses {
-		if addr.Type == "InternalIP" {
+		if addr.Type == clusterv1.MachineInternalIP {
 			nodeIP = addr.Address
 			break
 		}
@@ -212,7 +216,6 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 		}
 	}
 
-	// Fallback: the entire raw payload might be the machine config.
-	// This handles edge cases where the bootstrap provider sends raw config.
-	return raw, nil
+	// No recognized bootstrap data format found.
+	return nil, fmt.Errorf("could not extract Talos machine config from bootstrap data: no recognized field (tried data, value, spec.data, spec.talosConfig)")
 }
