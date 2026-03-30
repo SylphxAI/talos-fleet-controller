@@ -37,6 +37,12 @@ type ExtensionHandlers struct {
 
 	// state tracks in-flight UpdateMachine operations keyed by Machine namespace/name.
 	state sync.Map
+
+	// configPatches stores strategic merge patches computed by CanUpdateMachine,
+	// keyed by Machine namespace/name. UpdateMachine retrieves and applies these
+	// patches on top of the node's live config so that per-node identity
+	// (hostname, VLAN, MAC, IPv6) injected at Day 0 is preserved.
+	configPatches sync.Map // map[string][]configpatcher.Patch
 }
 
 // NewExtensionHandlers creates a new ExtensionHandlers instance.

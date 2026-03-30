@@ -28,6 +28,9 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
+
 	"github.com/SylphxAI/talos-fleet-controller/internal/talos"
 )
 
@@ -55,15 +58,20 @@ type updateState struct {
 
 // DoUpdateMachine implements the UpdateMachine hook.
 //
-// When CAPI calls this hook, we:
-//  1. Extract the desired Talos machine config from the BootstrapConfig
-//  2. Determine the node IP from the Machine's status addresses
-//  3. Choose the apply mode:
+// Uses PATCH mode to preserve per-node identity (hostname, VLAN, MAC, IPv6)
+// that CAPHR injected at Day 0. Instead of sending the full desired config
+// (which would overwrite per-node fields), we:
+//
+//  1. Retrieve the strategic merge patches computed by CanUpdateMachine
+//     (diff between Current and Desired BootstrapConfig templates)
+//  2. Read the node's live config (which has per-node identity fields)
+//  3. Apply the template-level diff on top of the live config
+//  4. Choose the apply mode:
 //     - Control plane nodes (has control-plane label): mode=no-reboot
 //     - Worker nodes: mode=auto
-//  4. Call talosctl apply-config via the Talos gRPC API
-//  5. Return Retry while waiting for the config to take effect
-//  6. Return Success once we have waited long enough / config is applied
+//  5. Send the merged result via Talos ApplyConfiguration API
+//  6. Return Retry while waiting for the config to take effect
+//  7. Return Success once the node has settled
 //
 // This hook is idempotent — CAPI may call it multiple times for the same Machine.
 func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehooksv1.UpdateMachineRequest, resp *runtimehooksv1.UpdateMachineResponse) {
@@ -102,6 +110,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 		// Check timeout.
 		if time.Since(state.startedAt) > updateTimeoutDuration {
 			h.state.Delete(key)
+			h.configPatches.Delete(key)
 			resp.Status = runtimehooksv1.ResponseStatusFailure
 			resp.Message = fmt.Sprintf("update timed out after %s", updateTimeoutDuration)
 			return
@@ -113,6 +122,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 			// we would poll node readiness here.
 			if time.Since(state.startedAt) > 30*time.Second {
 				h.state.Delete(key)
+				h.configPatches.Delete(key)
 				resp.Status = runtimehooksv1.ResponseStatusSuccess
 				resp.Message = "Config applied successfully; update complete"
 				resp.RetryAfterSeconds = 0
@@ -126,13 +136,62 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 		}
 	}
 
-	// Extract the desired machine config from BootstrapConfig.
-	configYAML, err := extractBootstrapData(req.Desired.BootstrapConfig.Raw)
-	if err != nil {
+	// --- PATCH MODE ---
+	// Instead of extracting the full desired config and replacing the node's config
+	// (which would overwrite per-node identity injected by CAPHR at Day 0),
+	// we retrieve the strategic merge patches computed by CanUpdateMachine
+	// (diff between Current and Desired BootstrapConfig templates) and apply
+	// them on top of the node's live config.
+	//
+	// Flow:
+	//   1. Retrieve stored patches from CanUpdateMachine (template-level diff)
+	//   2. Read the node's live config (which has per-node identity fields)
+	//   3. Apply the patches on top of the live config
+	//   4. Send the merged result via ApplyConfiguration
+	//
+	// This preserves per-node identity (hostname, VLAN, MAC, IPv6) because
+	// those fields are not in the template diff — they only exist on the live node.
+
+	// Step 1: Retrieve the stored patches from CanUpdateMachine.
+	// Use Load (not LoadAndDelete) because CAPI may retry UpdateMachine
+	// multiple times if ApplyConfig fails transiently. We clean up after
+	// successful apply.
+	patchesVal, hasPatch := h.configPatches.Load(key)
+	if !hasPatch {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = "failed to extract bootstrap config data: " + err.Error()
+		resp.Message = "no config patch found — CanUpdateMachine must run before UpdateMachine"
 		return
 	}
+	patches := patchesVal.([]configpatcher.Patch)
+
+	// Step 2: Read the node's live config.
+	liveProvider, err := h.TalosClient.NodeConfigProvider(ctx, nodeIP)
+	if err != nil {
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = "failed to read live config from node: " + err.Error()
+		return
+	}
+
+	// Step 3: Apply the template diff patches on top of the live config.
+	patched, err := configpatcher.Apply(configpatcher.WithConfig(liveProvider), patches)
+	if err != nil {
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = "failed to apply config patch: " + err.Error()
+		return
+	}
+
+	patchedBytes, err := patched.Bytes()
+	if err != nil {
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = "failed to encode patched config: " + err.Error()
+		return
+	}
+
+	log.Info("Config patch applied",
+		"patchCount", len(patches),
+		"liveConfigLen", len(mustEncodeProvider(liveProvider)),
+		"patchedConfigLen", len(patchedBytes),
+	)
 
 	// Determine apply mode based on node role.
 	mode := talos.ApplyModeAuto
@@ -143,9 +202,9 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 		log.Info("Worker node detected — using auto mode", "nodeIP", nodeIP)
 	}
 
-	// Apply the config via Talos API.
-	log.Info("Applying config via Talos API", "nodeIP", nodeIP, "mode", mode, "configLen", len(configYAML))
-	if err := h.TalosClient.ApplyConfig(ctx, nodeIP, configYAML, mode); err != nil {
+	// Apply the patched config via Talos API.
+	log.Info("Applying patched config via Talos API", "nodeIP", nodeIP, "mode", mode, "configLen", len(patchedBytes))
+	if err := h.TalosClient.ApplyConfig(ctx, nodeIP, patchedBytes, mode); err != nil {
 		// If this is the first attempt, record the state and retry.
 		// Transient errors (node rebooting, etc.) should resolve on retry.
 		if !loaded {
@@ -157,7 +216,8 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 		return
 	}
 
-	// Config applied successfully. Store state and return retry to allow settling.
+	// Config applied successfully. Clean up stored patches and record state.
+	h.configPatches.Delete(key)
 	h.state.Store(key, &updateState{startedAt: time.Now(), applied: true})
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 	resp.Message = "Config applied via Talos API; waiting for node to settle"
@@ -218,4 +278,11 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 
 	// No recognized bootstrap data format found.
 	return nil, fmt.Errorf("could not extract Talos machine config from bootstrap data: no recognized field (tried data, value, spec.data, spec.talosConfig)")
+}
+
+// mustEncodeProvider encodes a config.Provider to YAML bytes for logging.
+// Returns nil on error (used only for log messages, not critical path).
+func mustEncodeProvider(p interface{ EncodeBytes(...encoder.Option) ([]byte, error) }) []byte {
+	b, _ := p.EncodeBytes(encoder.WithComments(encoder.CommentsDisabled))
+	return b
 }

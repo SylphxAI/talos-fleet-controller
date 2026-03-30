@@ -25,6 +25,9 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
+
+	"github.com/siderolabs/talos/pkg/machinery/config/configdiff"
+	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 )
 
 // DoCanUpdateMachine implements the CanUpdateMachine hook.
@@ -99,11 +102,57 @@ func (h *ExtensionHandlers) DoCanUpdateMachine(ctx context.Context, req *runtime
 	}
 	resp.Status = runtimehooksv1.ResponseStatusSuccess
 
+	// Compute and store strategic merge patches for the Talos machine config.
+	// UpdateMachine (which only receives Desired, not Current) retrieves these
+	// patches and applies them on top of the node's live config. This preserves
+	// per-node identity (hostname, VLAN, MAC, IPv6) that CAPHR injected at Day 0.
+	machineKey := klog.KObj(&req.Desired.Machine).String()
+	if err := h.storeBootstrapConfigDiff(machineKey, req.Current.BootstrapConfig.Raw, req.Desired.BootstrapConfig.Raw); err != nil {
+		// Log but don't fail the CanUpdateMachine response — we still claim
+		// we can handle the changes. UpdateMachine will fail if the stored
+		// patches are missing, which is the safe default (avoids overwriting
+		// per-node identity with a full config replace).
+		log.Error(err, "Failed to compute/store bootstrap config diff for patch mode")
+	}
+
 	log.Info("CanUpdateMachine completed",
 		"machinePatchLen", len(machinePatch),
 		"bootstrapPatchLen", len(bootstrapConfigPatch),
 		"infraPatchLen", len(infraPatch),
 	)
+}
+
+// storeBootstrapConfigDiff computes the strategic merge patch between the current
+// and desired BootstrapConfig and stores it for later use by UpdateMachine.
+func (h *ExtensionHandlers) storeBootstrapConfigDiff(machineKey string, currentRaw, desiredRaw []byte) error {
+	currentYAML, err := extractBootstrapData(currentRaw)
+	if err != nil {
+		return err
+	}
+
+	desiredYAML, err := extractBootstrapData(desiredRaw)
+	if err != nil {
+		return err
+	}
+
+	currentProvider, err := configloader.NewFromBytes(currentYAML)
+	if err != nil {
+		return err
+	}
+
+	desiredProvider, err := configloader.NewFromBytes(desiredYAML)
+	if err != nil {
+		return err
+	}
+
+	patches, err := configdiff.Patch(currentProvider, desiredProvider)
+	if err != nil {
+		return err
+	}
+
+	h.configPatches.Store(machineKey, patches)
+
+	return nil
 }
 
 // DoCanUpdateMachineSet implements the CanUpdateMachineSet hook.
