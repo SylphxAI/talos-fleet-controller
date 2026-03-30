@@ -369,6 +369,10 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 	log := logf.FromContext(ctx)
 	nodeName := a.node.Name
 
+	// Track whether a reboot is expected so we can wait for the full reboot
+	// cycle before declaring the node updated (prevents multi-CP reboot race).
+	needsReboot := false
+
 	// Pre-flight: etcd quorum check for CP nodes.
 	if a.isCP {
 		members, err := r.TalosClient.EtcdMembers(ctx, a.nodeIP)
@@ -471,6 +475,11 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		}
 		updatesTotal.WithLabelValues(fns.Name, "config", "success").Inc()
 		log.Info("config applied", "node", nodeName)
+
+		// Mark reboot expected if config was applied in reboot mode.
+		if mode == talos.ApplyModeReboot {
+			needsReboot = true
+		}
 	}
 
 	// Step 4: Upgrade if version drifted.
@@ -486,10 +495,14 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 		}
 		updatesTotal.WithLabelValues(fns.Name, "upgrade", "success").Inc() // H4: upgrade metrics
 		log.Info("upgrade started", "node", nodeName, "image", installerImage)
+		needsReboot = true // Upgrades always involve a full reboot.
 	}
 
 	// Step 5: Wait for node to become Ready.
-	r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseHealthChecking, "Waiting for node Ready")
+	// If config was applied in reboot mode or an upgrade was triggered, wait
+	// for the full reboot cycle first. This prevents the race condition where
+	// waitNodeReady returns immediately because the reboot hasn't started yet,
+	// causing multiple control-plane nodes to reboot simultaneously.
 	timeout := fns.Spec.UpdateStrategy.HealthCheckTimeout.Duration
 	if timeout == 0 {
 		timeout = 120 * time.Second
@@ -498,10 +511,20 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 	if a.versionDrift && timeout < upgradeHealthCheckTimeout {
 		timeout = upgradeHealthCheckTimeout
 	}
-	if err := r.waitNodeReady(ctx, a.node.Name, timeout); err != nil {
-		_ = r.uncordonNode(ctx, a.node)
-		_ = r.removeUpdateAnnotation(ctx, a.node)
-		return fmt.Errorf("health check %s: %w", nodeName, err)
+	if needsReboot {
+		r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseHealthChecking, "Waiting for node reboot")
+		if err := r.waitNodeReboot(ctx, a.node.Name, 60*time.Second, timeout); err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
+			return fmt.Errorf("reboot wait %s: %w", nodeName, err)
+		}
+	} else {
+		r.setNodeStatus(fns, nodeName, fleetv1alpha1.NodePhaseHealthChecking, "Waiting for node Ready")
+		if err := r.waitNodeReady(ctx, a.node.Name, timeout); err != nil {
+			_ = r.uncordonNode(ctx, a.node)
+			_ = r.removeUpdateAnnotation(ctx, a.node)
+			return fmt.Errorf("health check %s: %w", nodeName, err)
+		}
 	}
 
 	// Step 5b: Remove pending-config taint if present.
@@ -852,6 +875,45 @@ func (r *FleetNodeSetReconciler) waitNodeReady(ctx context.Context, nodeName str
 		time.Sleep(5 * time.Second)
 	}
 	return fmt.Errorf("node %s not Ready within %s", nodeName, timeout)
+}
+
+// waitNodeReboot waits for a node to go NotReady (reboot started), then waits
+// for it to become Ready again. This prevents the race condition where
+// waitNodeReady returns immediately because the reboot hasn't started yet,
+// which would cause the controller to move on to the next node while the
+// current one is still rebooting — violating maxUnavailable.
+func (r *FleetNodeSetReconciler) waitNodeReboot(ctx context.Context, nodeName string, notReadyTimeout, readyTimeout time.Duration) error {
+	log := logf.FromContext(ctx)
+
+	// Phase 1: Wait for node to go NotReady (reboot started).
+	deadline := time.Now().Add(notReadyTimeout)
+	for time.Now().Before(deadline) {
+		var node corev1.Node
+		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+			// Node might be temporarily unreachable during reboot.
+			log.Info("node unreachable during reboot wait, treating as reboot started", "node", nodeName)
+			break
+		}
+
+		ready := false
+		for _, c := range node.Status.Conditions {
+			if c.Type == corev1.NodeReady {
+				ready = c.Status == corev1.ConditionTrue
+				break
+			}
+		}
+
+		if !ready {
+			log.Info("node rebooting (NotReady detected)", "node", nodeName)
+			break
+		}
+
+		time.Sleep(3 * time.Second)
+	}
+
+	// Phase 2: Wait for node to become Ready again.
+	log.Info("waiting for node to come back Ready after reboot", "node", nodeName)
+	return r.waitNodeReady(ctx, nodeName, readyTimeout)
 }
 
 // --- Status helpers ---
