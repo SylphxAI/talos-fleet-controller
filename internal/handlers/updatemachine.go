@@ -88,7 +88,8 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 	key := klog.KObj(&req.Desired.Machine).String()
 	machine := &req.Desired.Machine
 
-	// Find the node's internal IP from Machine status addresses.
+	// Find the node's IP from Machine status addresses.
+	// Prefer InternalIP (VLAN), fallback to ExternalIP (public).
 	nodeIP := ""
 	for _, addr := range machine.Status.Addresses {
 		if addr.Type == clusterv1.MachineInternalIP {
@@ -97,8 +98,16 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 		}
 	}
 	if nodeIP == "" {
+		for _, addr := range machine.Status.Addresses {
+			if addr.Type == clusterv1.MachineExternalIP {
+				nodeIP = addr.Address
+				break
+			}
+		}
+	}
+	if nodeIP == "" {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
-		resp.Message = "Machine has no InternalIP address — cannot connect via Talos API"
+		resp.Message = "Machine has no IP address — cannot connect via Talos API"
 		return
 	}
 
