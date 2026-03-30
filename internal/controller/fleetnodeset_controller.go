@@ -467,6 +467,17 @@ func (r *FleetNodeSetReconciler) executeNodeUpdate(ctx context.Context, fns *fle
 				"node", nodeName)
 			mode = talos.ApplyModeReboot
 		}
+
+		// Safety: NEVER reboot control-plane nodes via TFC config apply.
+		// CP hostname/network changes require etcd member management that TFC doesn't handle.
+		// Config is stored and takes effect on next natural reboot (upgrade, CAPI rolling update).
+		if _, ok := a.node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+			if mode != talos.ApplyModeNoReboot {
+				log.Info("control-plane node — forcing no-reboot mode to protect etcd", "node", nodeName, "originalMode", mode)
+				mode = talos.ApplyModeNoReboot
+			}
+		}
+
 		if err := r.TalosClient.ApplyConfig(ctx, a.nodeIP, mergedConfig, mode); err != nil {
 			updatesTotal.WithLabelValues(fns.Name, "config", "failure").Inc()
 			_ = r.uncordonNode(ctx, a.node)
