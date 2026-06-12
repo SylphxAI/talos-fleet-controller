@@ -3,6 +3,8 @@ name: E2E Tests
 on:
   push:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   test-e2e:
