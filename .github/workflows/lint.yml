@@ -14,12 +14,23 @@ jobs:
       - name: Clone the code
         uses: actions/checkout@v4
 
+      - name: Detect product source changes
+        id: product_changes
+        run: bash .github/scripts/product-source-affected.sh
+
+      - name: Skip product lint
+        if: steps.product_changes.outputs.product_changed == 'false'
+        run: echo "No product source changes detected; product lint is not affected."
+
       - name: Setup Go
+        if: steps.product_changes.outputs.product_changed != 'false'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
       - name: Check linter configuration
+        if: steps.product_changes.outputs.product_changed != 'false'
         run: make lint-config
       - name: Run linter
+        if: steps.product_changes.outputs.product_changed != 'false'
         run: make lint
