@@ -3,9 +3,11 @@ set -euo pipefail
 
 output_file="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
 
-if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+ref_name="${GITHUB_REF_NAME:-${GITHUB_REF#refs/heads/}}"
+
+if [ "${GITHUB_EVENT_NAME:-}" = "push" ] && { [ "$ref_name" = "main" ] || [ "$ref_name" = "dev" ]; }; then
   echo "product_changed=true" >> "$output_file"
-  echo "Push event; running product checks."
+  echo "Protected branch push; running product checks."
   exit 0
 fi
 
