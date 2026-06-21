@@ -22,7 +22,7 @@ if [ -z "$changed_files" ]; then
   exit 0
 fi
 
-product_files="$(printf '%s\n' "$changed_files" | grep -Ev '^(PROJECT\.md|AGENTS\.md|CLAUDE\.md|\.doctrine/.*|\.github/workflows/(build|lint|test-e2e)\.yml|\.github/scripts/product-source-affected\.sh)$' || true)"
+product_files="$(printf '%s\n' "$changed_files" | grep -Ev '^(PROJECT\.md|AGENTS\.md|CLAUDE\.md|\.doctrine/.*|\.github/workflows/(build|lint|test|test-e2e)\.yml|\.github/scripts/product-source-affected\.sh)$' || true)"
 
 if [ -z "$product_files" ]; then
   echo "product_changed=false" >> "$output_file"
