@@ -1,0 +1,168 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "repo": "SylphxAI/talos-fleet-controller",
+    "name": "talos-fleet-controller",
+    "lifecycle": "active",
+    "layer": "domain-service",
+    "summary": "Kubernetes controller for declarative Talos Linux node config convergence and OS upgrades through a FleetNodeSet CRD.",
+    "goals": [
+      "Provide a Kubernetes-native controller for Talos machine config convergence and OS upgrades.",
+      "Keep the FleetNodeSet API, controller behavior, generated manifests, Helm chart, examples, and image build path coherent.",
+      "Preserve day-2 safety controls including drift detection, maintenance windows, dry-run, pause, health checks, and limited unavailability."
+    ],
+    "nonGoals": [
+      "Own Talos Linux, Omni, Cluster API provisioning, or bare-metal lifecycle outside the documented FleetNodeSet surface.",
+      "Encode one cluster's site-specific topology, credentials, IP plan, or rollout policy as controller defaults.",
+      "Publish enterprise doctrine, project manifest schema, org rulesets, rollout issue reconciliation, or shared CI policy."
+    ]
+  },
+  "boundaries": {
+    "owns": [
+      {
+        "name": "fleetnodeset-api",
+        "description": "The fleet.talos.dev FleetNodeSet Kubernetes API, generated CRD, samples, and compatibility expectations."
+      },
+      {
+        "name": "talos-reconcile-controller",
+        "description": "Controller-runtime reconciliation that compares desired Talos version and machine config with node state and applies safe updates."
+      },
+      {
+        "name": "controller-distribution",
+        "description": "Dockerfile, GHCR image build workflow, Helm chart, config manifests, and raw deploy examples for running the controller."
+      }
+    ],
+    "doesNotOwn": [
+      "Talos Linux core behavior, Omni, Cluster API provisioning, Kubernetes cluster ownership, or consumer GitOps topology.",
+      "Site-specific machine config, node labels, secrets, IP addressing, maintenance policy, or workload scheduling policy.",
+      "Enterprise doctrine, project manifest schema, rollout issue reconciliation, org rulesets, or shared workflow implementation."
+    ],
+    "publicSurfaces": [
+      {
+        "type": "documentation",
+        "name": "Controller README",
+        "location": "README.md"
+      },
+      {
+        "type": "api",
+        "name": "FleetNodeSet CRD",
+        "location": "config/crd/bases/fleet.talos.dev_fleetnodesets.yaml"
+      },
+      {
+        "type": "manifest",
+        "name": "Helm chart",
+        "location": "charts/talos-fleet-controller/"
+      },
+      {
+        "type": "manifest",
+        "name": "Raw deploy manifests",
+        "location": "deploy/"
+      },
+      {
+        "type": "workflow",
+        "name": "Build and push workflow",
+        "location": ".github/workflows/build.yml"
+      },
+      {
+        "type": "workflow",
+        "name": "Lint workflow",
+        "location": ".github/workflows/lint.yml"
+      },
+      {
+        "type": "workflow",
+        "name": "Unit test workflow",
+        "location": ".github/workflows/test.yml"
+      },
+      {
+        "type": "workflow",
+        "name": "E2E workflow",
+        "location": ".github/workflows/test-e2e.yml"
+      },
+      {
+        "type": "manifest",
+        "name": "Project control-plane manifest",
+        "location": ".doctrine/project.json"
+      }
+    ],
+    "allowedDependencies": [
+      {
+        "repo": "SylphxAI/doctrine",
+        "surface": "project manifest schema, standards, and rollout audit",
+        "direction": "downward"
+      },
+      {
+        "repo": "siderolabs/talos",
+        "surface": "documented Talos API and client behavior",
+        "direction": "external"
+      },
+      {
+        "repo": "kubernetes-sigs/kubebuilder",
+        "surface": "Kubebuilder scaffolding and generated Kubernetes API conventions",
+        "direction": "external"
+      }
+    ],
+    "forbiddenCouplings": [
+      "Do not require consumers to import internal Go packages instead of using the documented CRD, chart, image, or manifests.",
+      "Do not bake one cluster's credentials, node inventory, topology, IP addressing, or maintenance schedule into controller defaults.",
+      "Do not edit generated Kubebuilder artifacts directly; update source markers and regenerate.",
+      "Do not publish enterprise process policy from this repository instead of SylphxAI/doctrine or SylphxAI/.github."
+    ]
+  },
+  "documentation": {
+    "adr": {
+      "path": "docs/adr/",
+      "status": "planned"
+    },
+    "specs": {
+      "path": "README.md",
+      "status": "present"
+    },
+    "catalog": {
+      "path": ".doctrine/project.json",
+      "status": "present"
+    },
+    "runbooks": {
+      "path": "README.md",
+      "status": "present"
+    },
+    "generatedReferences": {
+      "path": "config/crd/bases/",
+      "status": "generated"
+    }
+  },
+  "delivery": {
+    "ciModel": "legacy-ci",
+    "requiredContexts": [
+      "build",
+      "lint",
+      "test",
+      "test-e2e"
+    ],
+    "deployPath": "Pull requests and merge groups run build, lint, unit, and e2e workflows; main pushes and tags build and push the controller image to GHCR.",
+    "productionProof": "Controller changes require CI plus image readback or cluster smoke evidence for the affected FleetNodeSet reconcile path before claiming production readiness.",
+    "recoveryClass": "runtime-rollback-only"
+  },
+  "adoption": {
+    "status": "baseline",
+    "gaps": [
+      {
+        "id": "adr29-not-adopted",
+        "description": "Upgrade from legacy workflow contexts to ADR-29 admission contexts when the controller is ready for full central policy enforcement.",
+        "owner": "SylphxAI/talos-fleet-controller",
+        "target": "Before full adoption"
+      },
+      {
+        "id": "crd-compatibility-contract-missing",
+        "description": "Document CRD versioning, backward compatibility, and forward-only recovery expectations for already-applied cluster APIs.",
+        "owner": "SylphxAI/talos-fleet-controller",
+        "target": "Before production lifecycle promotion"
+      },
+      {
+        "id": "production-smoke-contract-missing",
+        "description": "Document the cluster smoke, image readback, and reconcile evidence required after image-producing changes.",
+        "owner": "SylphxAI/talos-fleet-controller",
+        "target": "Before full adoption"
+      }
+    ]
+  }
+}

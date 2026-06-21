@@ -19,22 +19,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Detect product source changes
+        id: product_changes
+        run: bash .github/scripts/product-source-affected.sh
+
+      - name: Skip product image build
+        if: steps.product_changes.outputs.product_changed == 'false'
+        run: echo "No product source changes detected; product image build is not affected."
+
       - uses: actions/setup-go@v5
+        if: steps.product_changes.outputs.product_changed != 'false'
         with:
           go-version-file: go.mod
 
       - name: Test
+        if: steps.product_changes.outputs.product_changed != 'false'
         run: make test
 
       - name: Build binary
+        if: steps.product_changes.outputs.product_changed != 'false'
         run: make build
 
       - name: Set up Docker Buildx
+        if: steps.product_changes.outputs.product_changed != 'false'
         uses: docker/setup-buildx-action@v3
 
       # Push to GHCR (public, for open-source distribution)
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.product_changes.outputs.product_changed != 'false'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -42,6 +54,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker meta
+        if: steps.product_changes.outputs.product_changed != 'false'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -53,6 +66,7 @@ jobs:
             type=sha
 
       - name: Build and push
+        if: steps.product_changes.outputs.product_changed != 'false'
         uses: docker/build-push-action@v6
         with:
           context: .
