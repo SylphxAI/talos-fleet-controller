@@ -21,6 +21,7 @@ import (
 	"flag"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/spf13/pflag"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -93,9 +94,15 @@ func main() {
 
 	// Optional pprof profiler.
 	if profilerAddress != "" {
-		klog.Infof("Profiler listening at %s", profilerAddress)
+		setupLog.Info("Profiler listening for requests", "address", profilerAddress)
 		go func() {
-			klog.Info(http.ListenAndServe(profilerAddress, nil)) //nolint:gosec // profiler is opt-in
+			profilerServer := &http.Server{
+				Addr:              profilerAddress,
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+			if err := profilerServer.ListenAndServe(); err != nil {
+				setupLog.Error(err, "Profiler server exited")
+			}
 		}()
 	}
 

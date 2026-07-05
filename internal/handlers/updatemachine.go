@@ -27,7 +27,6 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	yaml "sigs.k8s.io/yaml"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
@@ -94,72 +93,11 @@ func (h *ExtensionHandlers) DoUpdateMachine(ctx context.Context, req *runtimehoo
 	key := klog.KObj(&req.Desired.Machine).String()
 	machine := &req.Desired.Machine
 
-	// Find the node's IP. Try Machine addresses first, then InfrastructureMachine.
-	// Prefer InternalIP (VLAN), fallback to ExternalIP (public).
-	nodeIP := findIP(machine.Status.Addresses)
-	if nodeIP == "" {
-		// Machine.Status.Addresses may be empty in UpdateMachineRequest.
-		// Try extracting from InfrastructureMachine status.
-		var infraStatus struct {
-			Addresses []clusterv1.MachineAddress `json:"addresses"`
-		}
-		if req.Desired.InfrastructureMachine.Raw != nil {
-			var infraObj map[string]json.RawMessage
-			if err := json.Unmarshal(req.Desired.InfrastructureMachine.Raw, &infraObj); err == nil {
-				if statusRaw, ok := infraObj["status"]; ok {
-					_ = json.Unmarshal(statusRaw, &infraStatus)
-					nodeIP = findIP(infraStatus.Addresses)
-				}
-			}
-		}
-	}
-	// Last resort: query actual Machine + Node from K8s API.
-	// UpdateMachineRequest.Desired may not include runtime status (addresses, nodeRef).
-	if nodeIP == "" && h.K8sClient != nil {
-		log.Info("IP lookup: querying actual Machine from K8s API",
-			"namespace", machine.Namespace, "name", machine.Name)
-		var actualMachine clusterv1.Machine
-		if err := h.K8sClient.Get(ctx, client.ObjectKey{
-			Namespace: machine.Namespace,
-			Name:      machine.Name,
-		}, &actualMachine); err != nil {
-			log.Error(err, "IP lookup: failed to get Machine from K8s API",
-				"namespace", machine.Namespace, "name", machine.Name)
-		} else {
-			log.Info("IP lookup: got Machine from K8s API",
-				"addressCount", len(actualMachine.Status.Addresses),
-				"nodeRef", actualMachine.Status.NodeRef.Name)
-			nodeIP = findIP(actualMachine.Status.Addresses)
-			if nodeIP == "" && actualMachine.Status.NodeRef.Name != "" {
-				log.Info("IP lookup: Machine has no usable address, trying Node",
-					"nodeRef", actualMachine.Status.NodeRef.Name)
-				var node corev1.Node
-				if err := h.K8sClient.Get(ctx, client.ObjectKey{Name: actualMachine.Status.NodeRef.Name}, &node); err != nil {
-					log.Error(err, "IP lookup: failed to get Node from K8s API",
-						"nodeName", actualMachine.Status.NodeRef.Name)
-				} else {
-					log.Info("IP lookup: got Node from K8s API",
-						"addressCount", len(node.Status.Addresses))
-					for _, addr := range node.Status.Addresses {
-						if addr.Type == corev1.NodeInternalIP {
-							nodeIP = addr.Address
-							break
-						}
-					}
-					if nodeIP == "" {
-						for _, addr := range node.Status.Addresses {
-							if addr.Type == corev1.NodeExternalIP {
-								nodeIP = addr.Address
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-	} else if nodeIP == "" {
-		log.Info("IP lookup: K8sReader is nil, cannot query K8s API")
-	}
+	// Find the node's IP: Machine addresses → InfrastructureMachine status →
+	// live Machine/Node from the K8s API. Prefers InternalIP (VLAN), falls
+	// back to ExternalIP (public).
+	ctx = ctrl.LoggerInto(ctx, log)
+	nodeIP := h.lookupNodeIP(ctx, machine, req.Desired.InfrastructureMachine.Raw)
 	if nodeIP == "" {
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = "Machine has no IP address — cannot connect via Talos API"
@@ -373,6 +311,90 @@ func isControlPlane(labels map[string]string) bool {
 	return ok
 }
 
+// lookupNodeIP resolves the IP to reach a Machine's node over the Talos API.
+// It tries, in order: the Machine's status addresses, the
+// InfrastructureMachine's status addresses, and finally the live Machine +
+// Node objects from the K8s API (UpdateMachineRequest.Desired may not include
+// runtime status). Prefers InternalIP (VLAN), falls back to ExternalIP
+// (public). Returns "" when no IP can be determined.
+func (h *ExtensionHandlers) lookupNodeIP(ctx context.Context, machine *clusterv1.Machine, infraMachineRaw []byte) string {
+	log := ctrl.LoggerFrom(ctx)
+
+	if ip := findIP(machine.Status.Addresses); ip != "" {
+		return ip
+	}
+
+	// Machine.Status.Addresses may be empty in UpdateMachineRequest —
+	// try extracting from InfrastructureMachine status.
+	if infraMachineRaw != nil {
+		var infraStatus struct {
+			Addresses []clusterv1.MachineAddress `json:"addresses"`
+		}
+		var infraObj map[string]json.RawMessage
+		if err := json.Unmarshal(infraMachineRaw, &infraObj); err == nil {
+			if statusRaw, ok := infraObj["status"]; ok {
+				_ = json.Unmarshal(statusRaw, &infraStatus)
+				if ip := findIP(infraStatus.Addresses); ip != "" {
+					return ip
+				}
+			}
+		}
+	}
+
+	// Last resort: query the actual Machine + Node from the K8s API.
+	if h.K8sClient == nil {
+		log.Info("IP lookup: K8sReader is nil, cannot query K8s API")
+		return ""
+	}
+	log.Info("IP lookup: querying actual Machine from K8s API",
+		"namespace", machine.Namespace, "name", machine.Name)
+	var actualMachine clusterv1.Machine
+	if err := h.K8sClient.Get(ctx, client.ObjectKey{
+		Namespace: machine.Namespace,
+		Name:      machine.Name,
+	}, &actualMachine); err != nil {
+		log.Error(err, "IP lookup: failed to get Machine from K8s API",
+			"namespace", machine.Namespace, "name", machine.Name)
+		return ""
+	}
+	log.Info("IP lookup: got Machine from K8s API",
+		"addressCount", len(actualMachine.Status.Addresses),
+		"nodeRef", actualMachine.Status.NodeRef.Name)
+	if ip := findIP(actualMachine.Status.Addresses); ip != "" {
+		return ip
+	}
+	if actualMachine.Status.NodeRef.Name == "" {
+		return ""
+	}
+
+	log.Info("IP lookup: Machine has no usable address, trying Node",
+		"nodeRef", actualMachine.Status.NodeRef.Name)
+	var node corev1.Node
+	if err := h.K8sClient.Get(ctx, client.ObjectKey{Name: actualMachine.Status.NodeRef.Name}, &node); err != nil {
+		log.Error(err, "IP lookup: failed to get Node from K8s API",
+			"nodeName", actualMachine.Status.NodeRef.Name)
+		return ""
+	}
+	log.Info("IP lookup: got Node from K8s API", "addressCount", len(node.Status.Addresses))
+	return nodeIPFromAddresses(node.Status.Addresses)
+}
+
+// nodeIPFromAddresses returns the first InternalIP from a Node's status
+// addresses, falling back to the first ExternalIP.
+func nodeIPFromAddresses(addresses []corev1.NodeAddress) string {
+	for _, addr := range addresses {
+		if addr.Type == corev1.NodeInternalIP {
+			return addr.Address
+		}
+	}
+	for _, addr := range addresses {
+		if addr.Type == corev1.NodeExternalIP {
+			return addr.Address
+		}
+	}
+	return ""
+}
+
 // extractBootstrapData extracts the machine config YAML from the raw
 // BootstrapConfig JSON. The bootstrap data is typically stored in
 // spec.data or spec.machineConfig depending on the bootstrap provider.
@@ -383,13 +405,13 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 	}
 
 	// Parse the raw bootstrap config to find the machine config data.
-	var obj map[string]interface{}
+	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal bootstrap config: %w", err)
 	}
 
 	// Try spec.data first (common for bootstrap providers that embed config).
-	if spec, ok := obj["spec"].(map[string]interface{}); ok {
+	if spec, ok := obj["spec"].(map[string]any); ok {
 		// Try spec.talosConfig (Talos bootstrap provider pattern).
 		if talosConfig, ok := spec["talosConfig"].(string); ok && talosConfig != "" {
 			return []byte(talosConfig), nil
@@ -422,7 +444,9 @@ func extractBootstrapData(raw []byte) ([]byte, error) {
 
 // mustEncodeProvider encodes a config.Provider to YAML bytes for logging.
 // Returns nil on error (used only for log messages, not critical path).
-func mustEncodeProvider(p interface{ EncodeBytes(...encoder.Option) ([]byte, error) }) []byte {
+func mustEncodeProvider(p interface {
+	EncodeBytes(...encoder.Option) ([]byte, error)
+}) []byte {
 	b, _ := p.EncodeBytes(encoder.WithComments(encoder.CommentsDisabled))
 	return b
 }
@@ -434,11 +458,11 @@ func extractStrategicPatches(raw []byte) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	var obj map[string]interface{}
+	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, fmt.Errorf("unmarshal BootstrapConfig: %w", err)
 	}
-	spec, ok := obj["spec"].(map[string]interface{})
+	spec, ok := obj["spec"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("no spec in BootstrapConfig")
 	}
@@ -446,7 +470,7 @@ func extractStrategicPatches(raw []byte) ([]string, error) {
 	if !ok {
 		return nil, nil // No strategic patches.
 	}
-	patchesArr, ok := patchesRaw.([]interface{})
+	patchesArr, ok := patchesRaw.([]any)
 	if !ok {
 		return nil, fmt.Errorf("strategicPatches is not an array")
 	}
@@ -459,98 +483,6 @@ func extractStrategicPatches(raw []byte) ([]string, error) {
 		patches = append(patches, s)
 	}
 	return patches, nil
-}
-
-// mergeDesiredWithPerNodeIdentity takes the desired template config YAML and the
-// live config YAML from the node, and produces a merged config that has the new
-// template values PLUS per-node identity preserved from the live config.
-//
-// Per-node identity fields (injected by CAPHR at Day 0):
-//   - machine.network.hostname
-//   - machine.network.interfaces (MAC, VLAN, addresses — entire array)
-//   - machine.kubelet.extraArgs (node-ip, provider-id)
-//   - machine.kubelet.nodeIP (validSubnets for dual-stack)
-//
-// Strategy: Parse both configs as YAML maps. Start with the desired config,
-// then overlay per-node fields from the live config. This preserves template
-// changes while keeping per-node identity intact.
-func mergeDesiredWithPerNodeIdentity(desiredYAML, liveYAML []byte) ([]byte, error) {
-	var desired, live map[string]interface{}
-	if err := yaml.Unmarshal(desiredYAML, &desired); err != nil {
-		return nil, fmt.Errorf("parse desired config: %w", err)
-	}
-	if err := yaml.Unmarshal(liveYAML, &live); err != nil {
-		return nil, fmt.Errorf("parse live config: %w", err)
-	}
-
-	liveMachine := getMap(live, "machine")
-	desiredMachine := getMap(desired, "machine")
-	if liveMachine == nil || desiredMachine == nil {
-		// Can't merge — return desired as-is.
-		return desiredYAML, nil
-	}
-
-	liveNetwork := getMap(liveMachine, "network")
-	desiredNetwork := getMap(desiredMachine, "network")
-
-	// Preserve hostname from live config.
-	if liveNetwork != nil && desiredNetwork != nil {
-		if hostname, ok := liveNetwork["hostname"]; ok {
-			desiredNetwork["hostname"] = hostname
-		}
-	}
-
-	// Preserve entire interfaces array from live config.
-	// Interfaces contain per-node MAC addresses, VLAN IPs, device selectors —
-	// all injected by CAPHR at Day 0 and unique per node.
-	if liveNetwork != nil && desiredNetwork != nil {
-		if ifaces, ok := liveNetwork["interfaces"]; ok {
-			desiredNetwork["interfaces"] = ifaces
-		}
-	}
-
-	// Preserve kubelet per-node settings.
-	liveKubelet := getMap(liveMachine, "kubelet")
-	desiredKubelet := getMap(desiredMachine, "kubelet")
-	if desiredKubelet == nil && liveKubelet != nil {
-		desiredKubelet = map[string]interface{}{}
-		desiredMachine["kubelet"] = desiredKubelet
-	}
-	if liveKubelet != nil && desiredKubelet != nil {
-		// Merge extraArgs from live into desired (live takes precedence for per-node keys).
-		if liveArgs, ok := liveKubelet["extraArgs"].(map[string]interface{}); ok {
-			desiredArgs, _ := desiredKubelet["extraArgs"].(map[string]interface{})
-			if desiredArgs == nil {
-				desiredArgs = map[string]interface{}{}
-			}
-			for k, v := range liveArgs {
-				desiredArgs[k] = v
-			}
-			desiredKubelet["extraArgs"] = desiredArgs
-		}
-		// Preserve nodeIP (validSubnets for dual-stack).
-		if nodeIP, ok := liveKubelet["nodeIP"]; ok {
-			desiredKubelet["nodeIP"] = nodeIP
-		}
-	}
-
-	return yaml.Marshal(desired)
-}
-
-// getMap safely extracts a nested map from a parent map.
-func getMap(parent map[string]interface{}, key string) map[string]interface{} {
-	if parent == nil {
-		return nil
-	}
-	v, ok := parent[key]
-	if !ok {
-		return nil
-	}
-	m, ok := v.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	return m
 }
 
 // cleanupConfigCache removes the machine's entry from the config cache ConfigMap.
@@ -580,7 +512,7 @@ func (h *ExtensionHandlers) cleanupConfigCache(ctx context.Context, machineKey s
 // CanUpdateMachine persists the current BootstrapConfig raw bytes in a ConfigMap.
 // This method reads those bytes, combines them with the desired BootstrapConfig
 // from the UpdateMachineRequest, and re-computes the strategic merge patches.
-func (h *ExtensionHandlers) recoverPatchesFromConfigMap(ctx context.Context, machineKey string, desiredBootstrapRaw []byte) (interface{}, error) {
+func (h *ExtensionHandlers) recoverPatchesFromConfigMap(ctx context.Context, machineKey string, desiredBootstrapRaw []byte) (any, error) {
 	if h.K8sClient == nil {
 		return nil, fmt.Errorf("K8s client is nil")
 	}
