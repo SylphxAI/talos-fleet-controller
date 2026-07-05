@@ -38,12 +38,11 @@ spec:
           image: {{ include "talos-fleet-controller.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            {{- if .Values.controller.leaderElect }}
-            - --leader-elect
+            - --webhook-port={{ .Values.webhook.port }}
+            - --webhook-cert-dir={{ .Values.webhook.certDir }}
+            {{- with .Values.controller.profilerAddress }}
+            - --profiler-address={{ . }}
             {{- end }}
-            - --health-probe-bind-address={{ .Values.controller.healthProbeBindAddress }}
-            - --metrics-bind-address={{ .Values.controller.metricsBindAddress }}
-            - --metrics-secure={{ .Values.controller.metricsSecure }}
             {{- with .Values.controller.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -54,11 +53,8 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
-            - containerPort: 8081
-              name: health
-              protocol: TCP
-            - containerPort: 8080
-              name: metrics
+            - containerPort: {{ .Values.webhook.port }}
+              name: webhook
               protocol: TCP
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
@@ -69,6 +65,9 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           volumeMounts:
+            - name: webhook-certs
+              mountPath: {{ .Values.webhook.certDir }}
+              readOnly: true
             - name: talos-secrets
               mountPath: /var/run/secrets/talos.dev
               readOnly: true
@@ -76,6 +75,12 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
+        # TLS serving certificate for the Runtime SDK extension server.
+        # The binary does not self-generate certs; the pod stays unschedulable
+        # until this Secret exists (cert-manager or manual — see chart README).
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "talos-fleet-controller.webhookCertSecretName" . }}
         - name: talos-secrets
           secret:
             secretName: {{ include "talos-fleet-controller.talosServiceAccountName" . }}

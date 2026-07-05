@@ -1,4 +1,11 @@
 {{- if .Values.rbac.create }}
+# RBAC is scoped to what the current binary actually calls (see
+# internal/handlers): direct client GETs of CAPI Machines and Nodes for
+# node IP lookup, plus a ConfigMap used as the in-place update config
+# cache. Talos API credentials come from the mounted talos.dev
+# ServiceAccount Secret, not the Kubernetes API. The former
+# controller-manager rules (fleetnodesets, pods/eviction, events, leases)
+# will return together with the FleetNodeSet reconciler.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -6,38 +13,16 @@ metadata:
   labels:
     {{- include "talos-fleet-controller.labels" . | nindent 4 }}
 rules:
-  # FleetNodeSet CRD — full lifecycle management
-  - apiGroups: ["fleet.talos.dev"]
-    resources: ["fleetnodesets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["fleet.talos.dev"]
-    resources: ["fleetnodesets/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["fleet.talos.dev"]
-    resources: ["fleetnodesets/finalizers"]
-    verbs: ["update"]
-  # Nodes — read, cordon, uncordon
+  # CAPI Machines — read for node IP lookup during UpdateMachine.
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["machines"]
+    verbs: ["get"]
+  # Nodes — fallback node IP lookup via Machine status.nodeRef.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-  # Pods — list for drain operations
+    verbs: ["get"]
+  # ConfigMaps — persist the in-place update config cache.
   - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  # Pod eviction — drain before upgrade
-  - apiGroups: [""]
-    resources: ["pods/eviction"]
-    verbs: ["create"]
-  # Secrets — read Talos ServiceAccount credentials and machineConfig secretRefs
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
-  # Events — record reconcile events on FleetNodeSet resources
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
-  # Leases — leader election coordination
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
 {{- end }}

@@ -1,3 +1,7 @@
+# Raw deploy manifests for the CAPI Runtime SDK extension server.
+# The Helm chart (charts/talos-fleet-controller) is the canonical install
+# path and automates the serving-certificate flow; these manifests mirror it
+# for kubectl-only installs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,28 +24,25 @@ spec:
         - name: manager
           image: ghcr.io/sylphxai/talos-fleet-controller:main
           args:
-            - --leader-elect
-            - --health-probe-bind-address=:8081
-            - --metrics-bind-address=:8080
-            - --metrics-secure=false
+            - --webhook-port=9443
+            - --webhook-cert-dir=/tmp/k8s-webhook-server/serving-certs
           env:
             - name: TALOSCONFIG
               value: /var/run/secrets/talos.dev/config
           ports:
-            - containerPort: 8081
-              name: health
-            - containerPort: 8080
-              name: metrics
+            - containerPort: 9443
+              name: webhook
+          # The extension server has no HTTP health endpoints; the TLS
+          # listener only comes up after serving certs load, so a TCP
+          # probe on the webhook port is the health signal.
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: health
-            initialDelaySeconds: 15
+            tcpSocket:
+              port: webhook
+            initialDelaySeconds: 10
             periodSeconds: 20
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: health
+            tcpSocket:
+              port: webhook
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
@@ -61,10 +62,20 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:
+            - name: webhook-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
             - name: talos-secrets
               mountPath: /var/run/secrets/talos.dev
               readOnly: true
       volumes:
+        - name: webhook-certs
+          secret:
+            # TLS serving cert (tls.crt / tls.key, plus ca.crt for CAPI
+            # caBundle injection). Create via cert-manager or manually —
+            # see charts/talos-fleet-controller/README.md. The binary does
+            # not self-generate certificates.
+            secretName: tfc-webhook-cert
         - name: talos-secrets
           secret:
             # Created automatically by Talos ServiceAccount CRD controller
@@ -75,50 +86,49 @@ spec:
           operator: Exists
           effect: NoSchedule
 ---
+# Webhook Service targeted by the CAPI ExtensionConfig clientConfig when
+# the extension is registered (RuntimeSDK feature gate required).
+apiVersion: v1
+kind: Service
+metadata:
+  name: tfc-webhook
+  namespace: tfc-system
+  labels:
+    app.kubernetes.io/name: talos-fleet-controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: talos-fleet-controller
+  ports:
+    - name: https
+      port: 443
+      targetPort: webhook
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: tfc-controller
   namespace: tfc-system
 ---
+# Scoped to what the current binary calls: Machine/Node GETs for node IP
+# lookup and the in-place update config-cache ConfigMap.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: tfc-controller
 rules:
-  # FleetNodeSet CRD
-  - apiGroups: [fleet.talos.dev]
-    resources: [fleetnodesets]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [fleet.talos.dev]
-    resources: [fleetnodesets/status]
-    verbs: [get, update, patch]
-  - apiGroups: [fleet.talos.dev]
-    resources: [fleetnodesets/finalizers]
-    verbs: [update]
-  # Nodes — read + cordon/uncordon
+  # CAPI Machines — read for node IP lookup during UpdateMachine
+  - apiGroups: [cluster.x-k8s.io]
+    resources: [machines]
+    verbs: [get]
+  # Nodes — fallback node IP lookup via Machine status.nodeRef
   - apiGroups: [""]
     resources: [nodes]
-    verbs: [get, list, watch, update, patch]
-  # Pods — for drain
+    verbs: [get]
+  # ConfigMaps — in-place update config cache
   - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch]
-  - apiGroups: [""]
-    resources: [pods/eviction]
-    verbs: [create]
-  # Secrets — for Talos ServiceAccount + machineConfig secretRef
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get, list, watch]
-  # Events — for recording reconcile events
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch]
-  # Leader election
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [get, list, watch, create, update, patch, delete]
+    resources: [configmaps]
+    verbs: [get, create, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

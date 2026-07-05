@@ -82,3 +82,24 @@ Talos ServiceAccount name.
 {{- define "talos-fleet-controller.talosServiceAccountName" -}}
 {{- .Values.talosServiceAccount.name }}
 {{- end }}
+
+{{/*
+Webhook Service name.
+*/}}
+{{- define "talos-fleet-controller.webhookServiceName" -}}
+{{- printf "%s-webhook" (include "talos-fleet-controller.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Webhook serving-certificate Secret name.
+*/}}
+{{- define "talos-fleet-controller.webhookCertSecretName" -}}
+{{- default (printf "%s-cert" (include "talos-fleet-controller.fullname" .)) .Values.webhook.certSecretName }}
+{{- end }}
+
+{{/*
+ExtensionConfig name.
+*/}}
+{{- define "talos-fleet-controller.extensionConfigName" -}}
+{{- default (include "talos-fleet-controller.fullname" .) .Values.extensionConfig.name }}
+{{- end }}

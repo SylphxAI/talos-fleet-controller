@@ -129,6 +129,23 @@ TFC runs as a Deployment inside the cluster. It accesses the Talos API via [`kub
 
 🚧 **Under active development.**
 
+### What ships today
+
+The current `main` binary is a **Cluster API Runtime SDK extension server**
+(see `cmd/main.go`): it serves the in-place update hooks — `CanUpdateMachine`,
+`CanUpdateMachineSet`, `UpdateMachine` — over TLS (default port 9443) and
+applies Talos machine-config changes via the Talos API instead of
+reprovisioning machines. Its only flags are `--webhook-port`,
+`--webhook-cert-dir`, `--profiler-address`, and logging flags; there is no
+leader election, metrics endpoint, or HTTP health endpoint.
+
+The **FleetNodeSet reconciler described above is not in the binary yet.** The
+CRD ships with the Helm chart as declarative intent for the future
+convergence feature; FleetNodeSet resources are stored but not acted upon.
+Deployment details (serving certs, probes, CAPI `ExtensionConfig`
+registration) live in
+[`charts/talos-fleet-controller/README.md`](charts/talos-fleet-controller/README.md).
+
 | Version | Scope | Status |
 |---------|-------|--------|
 | v0.1.0 | Config apply + drift detection + sequential updates | 🔨 Building |
