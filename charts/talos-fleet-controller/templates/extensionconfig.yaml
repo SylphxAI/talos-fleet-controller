@@ -1,0 +1,30 @@
+{{- if .Values.extensionConfig.enabled }}
+# Registers this extension server with Cluster API. Gated behind
+# extensionConfig.enabled (default false) because it requires the CAPI
+# management cluster to run with the RuntimeSDK feature gate enabled —
+# creating it earlier is a no-op at best and a discovery-failure loop at
+# worst. Enable deliberately once the management cluster is ready.
+apiVersion: runtime.cluster.x-k8s.io/v1alpha1
+kind: ExtensionConfig
+metadata:
+  name: {{ include "talos-fleet-controller.extensionConfigName" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+  annotations:
+    # CAPI injects spec.clientConfig.caBundle from ca.crt of this Secret.
+    runtime.cluster.x-k8s.io/inject-ca-from-secret: {{ include "talos-fleet-controller.namespace" . }}/{{ include "talos-fleet-controller.webhookCertSecretName" . }}
+spec:
+  clientConfig:
+    service:
+      name: {{ include "talos-fleet-controller.webhookServiceName" . }}
+      namespace: {{ include "talos-fleet-controller.namespace" . }}
+      port: {{ .Values.service.port }}
+  {{- with .Values.extensionConfig.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.extensionConfig.settings }}
+  settings:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,18 @@
+# Webhook Service for the CAPI Runtime SDK extension server.
+# ExtensionConfig clientConfig points CAPI at this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "talos-fleet-controller.webhookServiceName" . }}
+  namespace: {{ include "talos-fleet-controller.namespace" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "talos-fleet-controller.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.service.port }}
+      targetPort: webhook
+      protocol: TCP

@@ -1,0 +1,42 @@
+{{- if .Values.certManager.enabled }}
+# Webhook serving certificate issued by cert-manager. The Runtime SDK
+# extension server does not self-generate TLS material; it reads
+# tls.crt / tls.key from webhook.certDir where this Secret is mounted.
+# cert-manager also writes ca.crt into the Secret, which the CAPI
+# ExtensionConfig controller uses for caBundle injection (see
+# templates/extensionconfig.yaml).
+#
+# cert-manager disabled? Create the Secret manually instead — see the
+# chart README for the openssl fallback.
+{{- if not .Values.certManager.issuerRef }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "talos-fleet-controller.fullname" . }}-selfsigned
+  namespace: {{ include "talos-fleet-controller.namespace" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "talos-fleet-controller.fullname" . }}-serving-cert
+  namespace: {{ include "talos-fleet-controller.namespace" . }}
+  labels:
+    {{- include "talos-fleet-controller.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "talos-fleet-controller.webhookCertSecretName" . }}
+  dnsNames:
+    - {{ include "talos-fleet-controller.webhookServiceName" . }}.{{ include "talos-fleet-controller.namespace" . }}.svc
+    - {{ include "talos-fleet-controller.webhookServiceName" . }}.{{ include "talos-fleet-controller.namespace" . }}.svc.cluster.local
+  issuerRef:
+    {{- if .Values.certManager.issuerRef }}
+    {{- toYaml .Values.certManager.issuerRef | nindent 4 }}
+    {{- else }}
+    kind: Issuer
+    name: {{ include "talos-fleet-controller.fullname" . }}-selfsigned
+    {{- end }}
+{{- end }}

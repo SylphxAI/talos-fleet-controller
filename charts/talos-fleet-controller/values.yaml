@@ -1,6 +1,12 @@
 # Talos Fleet Controller Helm values.
+#
+# The controller binary is a Cluster API Runtime SDK extension server
+# (CanUpdateMachine / CanUpdateMachineSet / UpdateMachine hooks) serving
+# TLS on the webhook port. It has no leader election, no metrics endpoint,
+# and no HTTP health endpoints — health is probed via TCP on the webhook port.
 
-# -- Number of controller replicas. Only one is active at a time (leader election).
+# -- Number of replicas. The extension server is stateless; more than one
+# replica can run behind the webhook Service.
 replicaCount: 1
 
 image:
@@ -9,6 +15,8 @@ image:
   # -- Image pull policy.
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (defaults to Chart appVersion).
+  # Note: only `main` and `sha-<commit>` tags are published today (no semver
+  # releases yet) — set this explicitly, preferably to an immutable sha tag.
   tag: ""
 
 # -- Image pull secrets for private registries.
@@ -46,15 +54,50 @@ talosServiceAccount:
   roles:
     - os:admin
 
+webhook:
+  # -- Port the Runtime SDK extension server listens on (TLS).
+  port: 9443
+  # -- Directory the server reads tls.crt / tls.key from. The server does NOT
+  # self-generate certificates; the secret below is mounted here.
+  certDir: /tmp/k8s-webhook-server/serving-certs
+  # -- Name of the TLS Secret mounted at certDir. Must contain tls.crt and
+  # tls.key (plus ca.crt for ExtensionConfig CA injection). Defaults to
+  # "<fullname>-cert". With certManager.enabled the Secret is created by
+  # cert-manager; otherwise create it manually (see chart README).
+  certSecretName: ""
+
+certManager:
+  # -- Issue the webhook serving certificate with cert-manager (a self-signed
+  # Issuer + Certificate). Requires cert-manager to be installed. Disable to
+  # bring your own TLS Secret (see webhook.certSecretName and the chart README).
+  enabled: true
+  # -- Use an existing cert-manager issuer instead of the chart's self-signed
+  # Issuer, e.g. {name: my-issuer, kind: ClusterIssuer, group: cert-manager.io}.
+  issuerRef: {}
+
+service:
+  # -- Port the webhook Service exposes (targets the webhook container port).
+  # ExtensionConfig clientConfig defaults to 443.
+  port: 443
+
+extensionConfig:
+  # -- Register the extension with Cluster API by creating an ExtensionConfig
+  # (runtime.cluster.x-k8s.io/v1alpha1). Requires CAPI running with the
+  # RuntimeSDK feature gate enabled — registration is a deliberate step;
+  # leave false until the management cluster is ready.
+  enabled: false
+  # -- Name of the ExtensionConfig (defaults to the chart fullname).
+  name: ""
+  # -- Limit the namespaces whose Clusters can use this extension (CAPI
+  # matches Cluster namespaces; empty selects all namespaces).
+  namespaceSelector: {}
+  # -- Arbitrary settings passed to the extension handlers.
+  settings: {}
+
 controller:
-  # -- Enable leader election for HA deployments.
-  leaderElect: true
-  # -- Bind address for health probes.
-  healthProbeBindAddress: ":8081"
-  # -- Bind address for Prometheus metrics.
-  metricsBindAddress: ":8080"
-  # -- Serve metrics over TLS.
-  metricsSecure: false
+  # -- Bind address to expose the pprof profiler (e.g. "localhost:6060").
+  # Empty disables profiling.
+  profilerAddress: ""
   # -- Extra arguments passed to the controller binary.
   extraArgs: []
   # -- Extra environment variables for the controller container.
@@ -72,12 +115,14 @@ resources:
     # -- Memory limit.
     memory: 256Mi
 
+# The extension server exposes no HTTP health endpoints; a TCP probe on the
+# webhook port verifies the TLS listener is up (the server only starts
+# listening after its serving certificate has been loaded).
 livenessProbe:
-  httpGet:
-    path: /healthz
-    port: health
+  tcpSocket:
+    port: webhook
   # -- Seconds before the first liveness check.
-  initialDelaySeconds: 15
+  initialDelaySeconds: 10
   # -- Interval between liveness checks.
   periodSeconds: 20
   # -- Seconds before the probe times out.
@@ -86,9 +131,8 @@ livenessProbe:
   failureThreshold: 3
 
 readinessProbe:
-  httpGet:
-    path: /readyz
-    port: health
+  tcpSocket:
+    port: webhook
   # -- Seconds before the first readiness check.
   initialDelaySeconds: 5
   # -- Interval between readiness checks.

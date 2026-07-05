@@ -1,5 +1,9 @@
 Talos Fleet Controller has been deployed to namespace "{{ include "talos-fleet-controller.namespace" . }}".
 
+The controller binary is a Cluster API Runtime SDK extension server exposing
+the in-place update hooks (CanUpdateMachine, CanUpdateMachineSet,
+UpdateMachine) over TLS on port {{ .Values.webhook.port }}.
+
 Prerequisites — ensure all managed Talos nodes have this in their machine config:
 
   machine:
@@ -9,27 +13,38 @@ Prerequisites — ensure all managed Talos nodes have this in their machine conf
         allowedRoles: [os:admin]
         allowedKubernetesNamespaces: [{{ include "talos-fleet-controller.namespace" . }}]
 
-Verify the controller is running:
+1. Verify the extension server is running:
 
-  kubectl -n {{ include "talos-fleet-controller.namespace" . }} get pods -l "{{ include "talos-fleet-controller.selectorLabels" . | replace "\n" "," }}"
+     kubectl -n {{ include "talos-fleet-controller.namespace" . }} get pods -l "{{ include "talos-fleet-controller.selectorLabels" . | replace ": " "=" | replace "\n" "," }}"
 
-Verify the Talos API credentials were provisioned:
+2. Verify the webhook serving certificate Secret exists
+{{- if .Values.certManager.enabled }} (issued by cert-manager):
+{{- else }} (cert-manager is disabled — you must create it manually, see the chart README):
+{{- end }}
 
-  kubectl -n {{ include "talos-fleet-controller.namespace" . }} get secret {{ include "talos-fleet-controller.talosServiceAccountName" . }}
+     kubectl -n {{ include "talos-fleet-controller.namespace" . }} get secret {{ include "talos-fleet-controller.webhookCertSecretName" . }}
 
-Create a FleetNodeSet to start managing nodes:
+   The pod cannot start until this Secret exists (it is mounted at
+   {{ .Values.webhook.certDir }}).
 
-  kubectl apply -f - <<EOF
-  apiVersion: fleet.talos.dev/v1alpha1
-  kind: FleetNodeSet
-  metadata:
-    name: my-nodes
-    namespace: {{ include "talos-fleet-controller.namespace" . }}
-  spec:
-    nodeSelector:
-      matchLabels:
-        node-role.kubernetes.io/control-plane: ""
-    talos:
-      version: v1.12.5
-      schematic: <your-schematic-id>
-  EOF
+3. Verify the Talos API credentials were provisioned:
+
+     kubectl -n {{ include "talos-fleet-controller.namespace" . }} get secret {{ include "talos-fleet-controller.talosServiceAccountName" . }}
+
+{{- if .Values.extensionConfig.enabled }}
+
+4. Verify the extension registered with Cluster API (requires the CAPI
+   RuntimeSDK feature gate):
+
+     kubectl get extensionconfig {{ include "talos-fleet-controller.extensionConfigName" . }} -o wide
+{{- else }}
+
+4. Extension registration is DISABLED (extensionConfig.enabled=false).
+   The server is healthy but Cluster API will not call it. Once your CAPI
+   management cluster runs with the RuntimeSDK feature gate enabled, set
+   extensionConfig.enabled=true to register the hooks.
+{{- end }}
+
+NOTE: the FleetNodeSet CRD is installed, but the current binary contains no
+FleetNodeSet reconciler — FleetNodeSet resources are stored as declarative
+intent for the future config-convergence feature and are not acted upon yet.

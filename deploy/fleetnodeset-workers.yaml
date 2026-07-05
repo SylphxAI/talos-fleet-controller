@@ -1,10 +1,17 @@
 # FleetNodeSet for our production worker nodes.
+#
+# NOTE: the current controller binary contains no FleetNodeSet reconciler
+# (it is a CAPI Runtime SDK in-place update extension) — this CR is stored
+# as declarative intent for the future convergence feature.
 apiVersion: fleet.talos.dev/v1alpha1
 kind: FleetNodeSet
 metadata:
   name: workers
   namespace: tfc-system
 spec:
+  # Safety default: ship paused. Unpausing is a deliberate operator action.
+  paused: true
+
   nodeSelector:
     matchExpressions:
       - key: node-role.kubernetes.io/control-plane

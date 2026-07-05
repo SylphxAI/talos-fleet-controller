@@ -304,7 +304,7 @@ func createBootstrapConfigPatch(currentRaw, desiredRaw []byte) ([]byte, error) {
 	}
 
 	// Unmarshal both into generic maps so we can produce a proper diff.
-	var currentObj, desiredObj map[string]interface{}
+	var currentObj, desiredObj map[string]any
 	if err := json.Unmarshal(currentRaw, &currentObj); err != nil {
 		return nil, err
 	}
@@ -334,7 +334,7 @@ func createInfraMachinePatch(currentRaw, desiredRaw []byte) ([]byte, error) {
 		return []byte("[]"), nil
 	}
 
-	var currentObj, desiredObj map[string]interface{}
+	var currentObj, desiredObj map[string]any
 	if err := json.Unmarshal(currentRaw, &currentObj); err != nil {
 		return nil, err
 	}
