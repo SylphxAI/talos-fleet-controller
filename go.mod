@@ -16,7 +16,6 @@ require (
 	k8s.io/klog/v2 v2.130.1
 	sigs.k8s.io/cluster-api v1.12.4
 	sigs.k8s.io/controller-runtime v0.23.3
-	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
@@ -103,7 +102,7 @@ require (
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20250128182459-e0ece0dbea4c // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.54.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
@@ -125,4 +124,5 @@ require (
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
+	sigs.k8s.io/yaml v1.6.0 // indirect
 )
