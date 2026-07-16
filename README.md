@@ -1,5 +1,10 @@
 # Talos Fleet Controller (TFC)
 
+<p align="center">
+  <img src="docs/banner.png" alt="talos-fleet-controller banner" width="100%" />
+</p>
+
+
 **Declarative node management for Talos Linux** — config convergence + OS upgrades via Kubernetes CRD.
 
 > The missing GitOps controller for Talos Linux. Detect drift, converge config, roll upgrades — all declarative.
