@@ -1,9 +1,8 @@
 # Talos Fleet Controller (TFC)
 
 <p align="center">
-  <img src="docs/banner.png" alt="talos-fleet-controller banner" width="100%" />
+  <img src="https://mark.sylphx.com/api/v1/banner?type=void&theme=tokyonight&text=talos+fleet+controller&desc=Declarative+node+management+for+Talos+Linux+%E2%80%94+config+convergence+%2B+OS+upgrades+v&height=200&animation=rise&credit=0" alt="talos-fleet-controller — Sylphx Mark banner" width="100%" />
 </p>
-
 
 **Declarative node management for Talos Linux** — config convergence + OS upgrades via Kubernetes CRD.
 
