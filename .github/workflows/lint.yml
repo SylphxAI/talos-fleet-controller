@@ -2,7 +2,10 @@ name: Lint
 
 on:
   workflow_dispatch:
+  # PRs own feature-branch validation. Keep push runs for durable trunk/dev
+  # postsubmit proof, rather than consuming the runner fleet twice per PR.
   push:
+    branches: [main, dev]
   pull_request:
   merge_group:
     types: [checks_requested]
