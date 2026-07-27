@@ -14,6 +14,7 @@ jobs:
   test-e2e:
     name: Run on Ubuntu
     runs-on: sylphx-linux-standard
+    timeout-minutes: 45
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -50,4 +51,24 @@ jobs:
         if: steps.product_changes.outputs.product_changed != 'false'
         run: |
           go mod tidy
-          make test-e2e
+          KIND_CREATE_ARGS=--retain make test-e2e
+
+      # The owned standard runner reproduces a Kind control-plane bootstrap
+      # failure that does not occur on the former hosted runner. Keep the
+      # failure evidence bounded and available for the Platform-owned runner
+      # capability fix; never bypass it with GitHub-hosted compute.
+      - name: Export Kind diagnostics on failure
+        if: failure() && steps.product_changes.outputs.product_changed != 'false'
+        run: |
+          mkdir -p kind-logs
+          kind export logs kind-logs --name talos-fleet-controller-test-e2e || true
+          find kind-logs -maxdepth 2 -type f -print | sort | sed -n '1,200p'
+
+      - name: Upload Kind diagnostics on failure
+        if: failure() && steps.product_changes.outputs.product_changed != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-e2e-diagnostics-${{ github.run_id }}
+          path: kind-logs
+          if-no-files-found: warn
+          retention-days: 7

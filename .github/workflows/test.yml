@@ -14,6 +14,7 @@ jobs:
   test:
     name: Run on Ubuntu
     runs-on: sylphx-linux-standard
+    timeout-minutes: 30
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
