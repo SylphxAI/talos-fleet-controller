@@ -12,13 +12,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Product builds must use the company-owned CI plane.
+    runs-on: sylphx-linux-standard
     permissions:
       contents: read
       packages: write
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify owned runner selector policy
+        run: bash .github/scripts/check-owned-runner-profiles.sh
 
       - name: Detect product source changes
         id: product_changes

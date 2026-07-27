@@ -22,7 +22,10 @@ if [ -z "$changed_files" ]; then
   exit 0
 fi
 
-product_files="$(printf '%s\n' "$changed_files" | grep -Ev '^(PROJECT\.md|AGENTS\.md|CLAUDE\.md|\.doctrine/.*|\.github/workflows/(build|lint|test|test-e2e)\.yml|\.github/scripts/product-source-affected\.sh)$' || true)"
+# CI workflow and selector-guard changes alter the execution boundary for the
+# controller's build/test/e2e lanes. Treat them as product-affecting so a
+# runner migration proves the actual workload instead of being a no-op skip.
+product_files="$(printf '%s\n' "$changed_files" | grep -Ev '^(PROJECT\.md|AGENTS\.md|CLAUDE\.md|\.doctrine/.*)$' || true)"
 
 if [ -z "$product_files" ]; then
   echo "product_changed=false" >> "$output_file"
