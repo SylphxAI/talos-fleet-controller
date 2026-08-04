@@ -54,6 +54,9 @@ jobs:
           set -euo pipefail
           docker info
           docker version
+          # Shared runners accumulate dead kind networks/containers; clear only kind leftovers.
+          docker ps -a --filter "name=kind" --format '{{.ID}} {{.Names}}' || true
+          docker network ls --filter "name=kind" || true
 
       - name: Running Test e2e
         if: steps.product_changes.outputs.product_changed != 'false'
@@ -63,5 +66,13 @@ jobs:
         run: |
           set -euo pipefail
           go mod tidy
-          make test-e2e
+          if ! make test-e2e; then
+            echo "::group::kind diagnostics"
+            kind get clusters || true
+            docker ps -a || true
+            docker logs "${KIND_CLUSTER}-control-plane" 2>/dev/null | tail -200 || true
+            echo "::endgroup::"
+            make cleanup-test-e2e || true
+            exit 1
+          fi
           make cleanup-test-e2e

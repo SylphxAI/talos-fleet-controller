@@ -1,0 +1,24 @@
+# Shared self-hosted kind config: tolerate cgroup/swap constraints on fleet runners.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  # Avoid multi-host collisions when several kind clusters share one docker daemon.
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 0
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            fail-swap-on: "false"
+      - |
+        kind: KubeletConfiguration
+        failSwapOn: false
+        # docker/default kind images often use cgroupfs on non-systemd hosts.
+        cgroupDriver: cgroupfs
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          timeoutForControlPlane: 10m0s
