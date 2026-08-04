@@ -10,7 +10,12 @@ on:
 jobs:
   test-e2e:
     name: Run on Ubuntu
-    runs-on: sylphx-linux-standard
+    # kind needs headroom + docker; avoid concurrent collision on shared runners
+    runs-on: sylphx-linux-xlarge
+    timeout-minutes: 45
+    concurrency:
+      group: talos-fleet-controller-kind-e2e
+      cancel-in-progress: false
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -40,8 +45,20 @@ jobs:
         if: steps.product_changes.outputs.product_changed != 'false'
         run: kind version
 
-      - name: Running Test e2e
+      - name: Ensure Docker is available
         if: steps.product_changes.outputs.product_changed != 'false'
         run: |
+          set -euo pipefail
+          docker info
+          docker version
+
+      - name: Running Test e2e
+        if: steps.product_changes.outputs.product_changed != 'false'
+        env:
+          # Isolate clusters across concurrent shared-runner jobs
+          KIND_CLUSTER: talos-fleet-controller-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
           go mod tidy
           make test-e2e
+          make cleanup-test-e2e

@@ -68,18 +68,15 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 KIND_CLUSTER ?= talos-fleet-controller-test-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+setup-test-e2e: ## Set up a Kind cluster for e2e tests (unique name, always recreate)
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
+	@echo "Ensuring clean Kind cluster '$(KIND_CLUSTER)'..."
+	@$(KIND) delete cluster --name $(KIND_CLUSTER) >/dev/null 2>&1 || true
+	@echo "Creating Kind cluster '$(KIND_CLUSTER)'..."
+	@$(KIND) create cluster --name $(KIND_CLUSTER) --wait 5m
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
