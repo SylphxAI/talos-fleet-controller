@@ -34,10 +34,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install kind (pinned)
         if: steps.product_changes.outputs.product_changed != 'false'
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          set -euo pipefail
+          # Pin for reproducible self-hosted behavior (latest drift has broken kubeadm wait on shared docker).
+          KIND_VERSION=v0.27.0
+          curl -fsSL -o ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
