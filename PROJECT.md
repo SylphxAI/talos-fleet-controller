@@ -44,7 +44,7 @@ GitOps configuration or consumer manifests.
 - `charts/talos-fleet-controller/` defines the Helm distribution surface.
 - `deploy/` and `config/` provide raw deployment and sample manifests.
 - `.github/workflows/*.yml` define build, lint, unit, and e2e CI.
-- `.doctrine/project.json` is the machine-readable project manifest.
+-  is the machine-readable project manifest.
 
 ## Delivery
 
@@ -55,4 +55,4 @@ readback or a cluster smoke proving the affected `FleetNodeSet` reconcile path.
 CRD and controller changes need forward-compatibility review because source
 revert alone does not remove already-applied Kubernetes API or cluster state.
 
-The authoritative control-plane record is `.doctrine/project.json`.
+The authoritative control-plane record is .
