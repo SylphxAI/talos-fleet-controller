@@ -5,7 +5,7 @@ Static engineering and delivery standards load from the active Skills runtime
 SSOT). Doctrine and Mission Control are retired historical lineage and must not
 be loaded as current instruction authority.
 
-Local truth: `PROJECT.md`, `.doctrine/project.json` when present.
+Local truth: `PROJECT.md`.
 
 ## Boundary hazards
 
@@ -14,7 +14,7 @@ Local truth: `PROJECT.md`, `.doctrine/project.json` when present.
 ## Local commands
 
 ```bash
-python3 /Users/kyle/.doctrine/scripts/project-control-plane-audit.py --local . --fail-on-drift --json
+python3 /Users/kyle/scripts/project-control-plane-audit.py --local . --fail-on-drift --json
 git diff --check
 ```
 
